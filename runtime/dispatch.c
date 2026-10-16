@@ -206,8 +206,9 @@ const char *rt_host_fn_name(uint64_t pc, uint64_t *offset) {
 }
 
 static const char *host_sym(uint64_t pc, uint64_t *offset) {
-    const char *s = plat_symbol(pc, offset);
-    return s ? s : rt_host_fn_name(pc, offset);
+    // (game functions first: they live in lasgame.dll, which the OS lookup can only name as a whole)
+    const char *s = rt_host_fn_name(pc, offset);
+    return s ? s : plat_symbol(pc, offset);
 }
 
 void rt_fatal_trace(void) {
@@ -263,10 +264,12 @@ bool rt_fault_watch(uint64_t fa, uint64_t pc) {
         static int nseen;
         const char *nm = host_sym(pc, NULL);
         if (!nm) nm = "?";
+        char key[48];  // (each function + offset once)
+        snprintf(key, sizeof key, "%.36s+%llx", nm, (unsigned long long)(fa - g_watch_lo));
         bool found = false;
-        for (int i = 0; i < nseen; i++) found |= !strcmp(seen[i], nm);
+        for (int i = 0; i < nseen; i++) found |= !strcmp(seen[i], key);
         if (!found && nseen < 64) {
-            snprintf(seen[nseen++], 48, "%s", nm);
+            snprintf(seen[nseen++], 48, "%s", key);
             fprintf(stderr, "[watch] +%#llx by %s\n", fa - g_watch_lo, nm);
         }
     }

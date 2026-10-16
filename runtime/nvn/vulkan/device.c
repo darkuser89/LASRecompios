@@ -527,11 +527,15 @@ void backend_present(NvnTexture *t) {
     frames++;
     total_frames++;
     g_frame_counter++;
+    extern void vk_pace_frame(void);
+    vk_pace_frame();  // (exec.c: the game's 30 fps mode when frames don't fit 60)
     extern void input_frame(uint64_t frame);
     input_frame(total_frames);
     static long slow_ms = -1;
     if (slow_ms < 0) slow_ms = getenv("LARECOMP_SLOW_FRAME_MS") ? atol(getenv("LARECOMP_SLOW_FRAME_MS")) : 0;
-    if (slow_ms > 0 && total_frames > 2600) SDL_Delay((Uint32)slow_ms);
+    static long slow_until = -1;  // LARECOMP_SLOW_FRAME_UNTIL=<frame>: the stall ends there (frame pacing recovery tests)
+    if (slow_until < 0) slow_until = getenv("LARECOMP_SLOW_FRAME_UNTIL") ? atol(getenv("LARECOMP_SLOW_FRAME_UNTIL")) : 0;
+    if (slow_ms > 0 && total_frames > 2600 && (!slow_until || (long)total_frames < slow_until)) SDL_Delay((Uint32)slow_ms);
     extern void fnprof_frame(uint64_t frame);
     fnprof_frame(total_frames);
     extern void warp_frame(uint64_t frame);
@@ -640,6 +644,13 @@ void ui_window_init(void) {
     if (getenv("LARECOMP_WINDOW")) sscanf(getenv("LARECOMP_WINDOW"), "%dx%d", &win_w, &win_h);
     SDL_WindowFlags wflags = SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
     if (getenv("LARECOMP_HIDDEN")) wflags |= SDL_WINDOW_HIDDEN;
+    {   // scripted test runs (user input ignored: runtime/hle/input.c input_user_blocked) open without taking the
+        // keyboard focus from whatever the player is doing
+        const char *v = getenv("LARECOMP_NO_USER_INPUT");
+        bool scripted = v ? atoi(v) != 0 : (getenv("LARECOMP_INPUT") || getenv("LARECOMP_DOORJUMP_TEST") || getenv("LARECOMP_PLACE") ||
+                                            getenv("LARECOMP_HOST_INPUT") || getenv("LARECOMP_BIND_TEST"));
+        if (scripted) SDL_SetHint(SDL_HINT_WINDOW_ACTIVATE_WHEN_SHOWN, "0");
+    }
     window = SDL_CreateWindow("LAS Recomp", win_w, win_h, wflags);
     if (!window) FATAL("SDL_CreateWindow: %s\n", SDL_GetError());
     rt_window_icon(window);
@@ -688,6 +699,8 @@ int ui_run(void) {
                 LOG("window closed\n");
                 exit(0);
             }
+            extern bool input_user_blocked(const SDL_Event *e);
+            if (input_user_blocked(&e)) continue;  // scripted test runs: the real keyboard / mouse / pads do nothing (as metal.m)
             if (menu_handle_event(&e)) continue;
             input_handle_event(&e);
         }

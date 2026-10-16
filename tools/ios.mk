@@ -1,21 +1,16 @@
 # iPadOS build (make ios-*). Included by the Makefile; see docs/ios.md.
 #
 # Three things differ from the desktop builds:
-#   - the guest window is relocated below the iOS user VA limit: 0xFC0000000 / 67.6 GB (xnu
-#     osfmk/mach/arm/vm_param.h MACH_VM_MAX_ADDRESS_RAW), so the macOS base 0x7000000000 (481 GB) cannot be mapped
-#     and the game code is generated for a low base instead (generated-ios/, IOS_BASE_MAIN/SDK below). The base is
-#     baked into the recompiled code, so the runtime is compiled with -DRT_BASE=<same>.
+#   - a compact guest window and smaller host thread stacks fit the normal iPadOS address space. Module bases
+#     stay identical to desktop, so the generated game code can be shared.
 #   - everything is static: SDL3 + FFmpeg from tools/build_deps_ios.sh (no dylibs to ship), and the game code is
 #     linked into the app (liblasgame_ios.a) instead of being built on the device by a compiler the app spawns.
 #   - Xcode does the runtime itself (ios/project.yml through xcodegen) so it can sign, install and debug it.
 
 IOS_MIN       ?= 17.0
 # The guest window stays at the upstream base on iOS: the kernel itself places large anonymous allocations at
-# 0x7000000000 (measured on the iPad Air M2: `vm_allocate(ANYWHERE)` of 2-12.5 GB lands exactly there), and an
-# explicit VM_FLAGS_FIXED request at 16 GB fails - that space is taken. What the app does need is address space
-# *above* the default iOS limit (MACH_VM_MAX_ADDRESS_RAW 0xFC0000000 / 67.6 GB), i.e. the Extended Virtual
-# Addressing entitlement in ios/LASRecomp.entitlements; the paid-team profile provisions it automatically, and
-# without it this reservation fails with a message (runtime/platform/ios.c probes and prints the address space).
+# 0x7000000000 (measured on the Air 4 for 2-4 GB allocations). The compact reservation is 2.5625 GB;
+# ios/project.yml enables it without requiring an Extended Virtual Addressing entitlement.
 # Because the base is the upstream one, the iOS build shares generated/ and the game code with the desktop build.
 IOS_BASE_MAIN ?= 0x7000000000
 IOS_BASE_SDK  ?= 0x7004000000

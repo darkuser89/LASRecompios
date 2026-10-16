@@ -9,12 +9,18 @@
 #include <string.h>
 #include <float.h>
 #include <math.h>
+#include <stdatomic.h>
 #include <sys/stat.h>
 #include <SDL3/SDL_timer.h>
 
 #include "maxwell/shader.h"
 #include "nvn.h"
 #include "renderer.h"
+#include "texture_bindings.h"
+#include "sampler_table.h"
+#ifdef LARECOMP_COMPACT_GUEST
+#include "gpu_memory.h"
+#endif
 
 static uint64_t hmix(uint64_t h, const void *p, size_t n);  // (shader code fingerprint; defined below)
 
@@ -27,6 +33,9 @@ static NSMutableDictionary<NSString *, id> *cache;
 static uint64_t stat_wait_by[3], stat_wait_n[3];
 static uint64_t stat_draws, stat_skipped, stat_passes, stat_dispatches, stat_wait_ns, stat_flushes, stat_feedback_copies;
 static double stat_gpu_s;
+static TextureBindings texture_bindings;
+static SamplerTables sampler_tables;
+static uint64_t stat_texture_bind_ns;
 uint64_t g_gpu_total_ns;  // GPU time of all completed command buffers (dynamic resolution: output_scale.c)
 // (forward: texture-lifetime cleanup and stats, defined further down)
 static int g_views_live;
@@ -84,10 +93,20 @@ bool renderer_origin_lower_left(void) { return nvn_window_origin() == 0; }
 
 static double stat_compile_ms;  // time spent building shaders/pipelines (first-use stutter)
 static int stat_compiles;
+static _Atomic unsigned pending_shader_jobs;
+unsigned renderer_pending_shaders(void) { return atomic_load(&pending_shader_jobs); }
 static inline double now_ms(void) { return (double)clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e6; }
 #define TIMED_COMPILE(expr) ({ double t0_ = now_ms(); __auto_type r_ = (expr); stat_compile_ms += now_ms() - t0_; stat_compiles++; r_; })
 
 const char *renderer_stats(void) {
+#ifdef LARECOMP_COMPACT_GUEST
+    gpu_memory_log_stats();
+#endif
+    if (getenv("LARECOMP_RENDER_STATS"))
+        LOG("[bindings] texture/sampler requests %llu, Metal calls %llu, CPU %.3f ms\n",
+            (unsigned long long)texture_bindings.requests, (unsigned long long)texture_bindings.calls, stat_texture_bind_ns / 1e6);
+    texture_bindings.requests = texture_bindings.calls = 0;
+    stat_texture_bind_ns = 0;
     static int dumps;
     if (dumps++ < 3) {
         LOG("[metal] command counts:");
@@ -99,6 +118,11 @@ const char *renderer_stats(void) {
     struct task_vm_info vmi;
     mach_msg_type_number_t vn = TASK_VM_INFO_COUNT;
     uint64_t foot = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &vn) == KERN_SUCCESS ? vmi.phys_footprint : 0;
+    if (foot && getenv("LARECOMP_RENDER_STATS"))
+        LOG("[memory] footprint %llu MiB, resident %llu MiB, internal %llu MiB, external %llu MiB, Metal %llu MiB\n",
+            (unsigned long long)(foot >> 20), (unsigned long long)(vmi.resident_size >> 20),
+            (unsigned long long)(vmi.internal >> 20), (unsigned long long)(vmi.external >> 20),
+            (unsigned long long)(dev.currentAllocatedSize >> 20));
     snprintf(stats_text, sizeof stats_text, "%llu draws, %llu skipped, %llu passes, %llu dispatches, %llu flushes, gpu %.0fms, wait %.0fms, compile %d/%.0fms, fbcopy %llu | tex %d (%.0f MB) views %d snaps %lu mem %.0f MB | waits fence %.0fms/%llu flush %.0fms/%llu all %.0fms/%llu", stat_draws, stat_skipped,
              stat_passes, stat_dispatches, stat_flushes, stat_gpu_s * 1000.0, (double)stat_wait_ns / 1e6 * 125.0 / 3.0, stat_compiles, stat_compile_ms, stat_feedback_copies,
              g_tex_live, g_tex_live_bytes / 1048576.0, g_views_live, (unsigned long)(g_snap_copies ? g_snap_copies.count : 0), foot / 1048576.0, stat_wait_by[0] / 24e3, (unsigned long long)stat_wait_n[0], stat_wait_by[1] / 24e3, (unsigned long long)stat_wait_n[1], stat_wait_by[2] / 24e3, (unsigned long long)stat_wait_n[2]);
@@ -625,7 +649,11 @@ static int cbuf_base = 3, tex_base = 8;
 
 static id<MTLBuffer> ring;
 static uint64_t ring_off;
+#if TARGET_OS_IPHONE
+#define RING_SIZE (8u << 20)
+#else
 #define RING_SIZE (64u << 20)
+#endif
 
 static uint64_t ring_alloc(const void *data, uint64_t size) {
     if (!ring) ring = [dev newBufferWithLength:RING_SIZE options:MTLResourceStorageModeShared];
@@ -644,11 +672,21 @@ static void ring_reset(void) { ring_off = 0; }
 
 // Bind guest memory [addr, addr+size) as a buffer: zero-copy inside the heap, copied otherwise.
 static void bind_guest(id<MTLRenderCommandEncoder> e, bool vertex_stage, uint64_t addr, uint64_t size, int index) {
+#ifdef LARECOMP_COMPACT_GUEST
+    if ((addr & 3) == 0 && size) {
+        uint64_t offset;
+        id<MTLBuffer> buffer = gpu_guest_buffer(addr, size, &offset);
+        if (vertex_stage) [e setVertexBuffer:buffer offset:offset atIndex:index];
+        else [e setFragmentBuffer:buffer offset:offset atIndex:index];
+        return;
+    }
+#else
     if (addr >= HEAP_BASE && addr + size <= HEAP_BASE + HEAP_MAX && (addr & 3) == 0) {
         if (vertex_stage) [e setVertexBuffer:g_guest_buffer offset:addr - HEAP_BASE atIndex:index];
         else [e setFragmentBuffer:g_guest_buffer offset:addr - HEAP_BASE atIndex:index];
         return;
     }
+#endif
     uint64_t off = ring_alloc((void *)(uintptr_t)addr, size);
     if (vertex_stage) [e setVertexBuffer:ring offset:off atIndex:index];
     else [e setFragmentBuffer:ring offset:off atIndex:index];
@@ -828,6 +866,11 @@ static void shader_cache_note(const char *vs, const char *fs) {
 }
 
 void shader_cache_warm(void) {
+#if TARGET_OS_IPHONE
+    // Compiling every cached shader alongside first-use programs overwhelms the Air 4's compiler service.
+    // Metal's disk cache is still populated normally as each program is used.
+    return;
+#endif
     static int started;
     if (started++ || getenv("LARECOMP_NO_SHADER_WARM")) return;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
@@ -891,8 +934,9 @@ static Prog *get_program(NvnProgram *p, ShaderKey *vkey, ShaderKey *fkey) {
     uint32_t slot = (uint32_t)(h ^ (h >> 31)) & (PROG_TAB - 1);
     while (prog_tab[slot].key && prog_tab[slot].key != h) slot = (slot + 1) & (PROG_TAB - 1);
     if (prog_tab[slot].key) { Prog *fp = (__bridge Prog *)prog_tab[slot].prog; return fp->failed ? nil : fp; }
-    NSString *key = [NSString stringWithFormat:@"%llx/%llx/%@/%@", p->stages[0].code_addr, p->stages[1].code_addr,
-                     [NSData dataWithBytes:vkey length:sizeof *vkey], [NSData dataWithBytes:fkey->rt_kind length:8]];
+    NSString *key = [NSString stringWithFormat:@"%llx/%llx/%@/%@%s", p->stages[0].code_addr, p->stages[1].code_addr,
+                     [NSData dataWithBytes:vkey length:sizeof *vkey], [NSData dataWithBytes:fkey->rt_kind length:8],
+                     vkey->flip_x ? "/mirror" : ""];  // (NSData's description elides the middle of the key's bytes)
     Prog *pr = cache[key];
     if (pr) {
         prog_tab[slot].key = h;
@@ -978,8 +1022,14 @@ static Prog *get_program(NvnProgram *p, ShaderKey *vkey, ShaderKey *fkey) {
     // First-time compiles take ~40 ms each on Metal: build off the render thread; draws using this program are
     // skipped until it's ready (the object appears a few frames later instead of the game stalling).
     static dispatch_queue_t q;
-    if (!q) q = dispatch_queue_create("larecomp.shaders", DISPATCH_QUEUE_CONCURRENT);
-    dispatch_async(q, ^{ compile_program(pr); });
+    if (!q) q = dispatch_queue_create("larecomp.shaders",
+#if TARGET_OS_IPHONE
+                                     DISPATCH_QUEUE_SERIAL);
+#else
+                                     DISPATCH_QUEUE_CONCURRENT);
+#endif
+    atomic_fetch_add(&pending_shader_jobs, 1);
+    dispatch_async(q, ^{ compile_program(pr); atomic_fetch_sub(&pending_shader_jobs, 1); });
     return pr;
 }
 
@@ -1023,7 +1073,7 @@ static id<MTLSamplerState> sampler_for(NvnSamplerDesc *d) {
         LOG("[sampler] min %u mag %u lod %g..%g aniso %g wrap %u %u\n", mf, d->mag_filter, d->lod_min, d->lod_max, d->max_aniso,
             d->wrap[0], d->wrap[1]);
     if (d->compare_mode) sd.compareFunction = getenv("LARECOMP_NO_SHADOW") ? MTLCompareFunctionAlways : compare_fn((uint8_t)d->compare_func);
-    sd.supportArgumentBuffers = NO;
+    sd.supportArgumentBuffers = YES;
     id<MTLSamplerState> s = [dev newSamplerStateWithDescriptor:sd];
     if (!s) {  // (no sampler at all: Metal would sample the texture with undefined filtering - worth saying out loud)
         static int n;
@@ -1040,6 +1090,7 @@ static id<MTLSamplerState> default_sampler(void) {
     if (!s) {
         MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
         sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear;
+        sd.supportArgumentBuffers = YES;
         s = [dev newSamplerStateWithDescriptor:sd];
     }
     return s;
@@ -1213,6 +1264,19 @@ static void resolve_feedback(Prog *pr) {
 }
 
 static void bind_textures(int stage, ShaderInfo *si) {
+    uint64_t bind_start = ENV("LARECOMP_RENDER_STATS") ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
+    texture_bindings_begin(&texture_bindings, enc);
+    static int reuse = -1;
+    if (reuse < 0) {
+#ifdef LARECOMP_COMPACT_GUEST
+        reuse = getenv("LARECOMP_TEXTURE_BIND_LEGACY") == NULL;
+#else
+        reuse = getenv("LARECOMP_TEXTURE_BIND_CACHE") != NULL;
+#endif
+    }
+    // NVN descriptors/default_sampler retain these until the table takes its own references.
+    // Avoid ARC array initialization/teardown in the common direct-binding path.
+    __unsafe_unretained id<MTLSamplerState> samplers[32];
     if (stage == 1) draw_bottle = draw_heart = 0, draw_item_cursor = false;
     for (int i = 0; i < si->ntex; i++) {
         ShaderTexture *st_ = &si->tex[i];
@@ -1305,9 +1369,16 @@ static void bind_textures(int stage, ShaderInfo *si) {
             snprintf(path, sizeof path, "build/dtex_%03d_%d_a.png", dn - 1, i);
             renderer_save_texture_alpha(tex, path);
         }
-        if (stage == 0) { [enc setVertexTexture:tex atIndex:i]; [enc setVertexSamplerState:smp atIndex:i]; }
-        else { [enc setFragmentTexture:tex atIndex:i]; [enc setFragmentSamplerState:smp atIndex:i]; }
+        texture_bindings_apply(&texture_bindings, enc, stage, i, tex, smp, reuse, !si->uses_sampler_table);
+        if (si->uses_sampler_table) samplers[i] = smp;
     }
+    if (si->uses_sampler_table) {
+        id<MTLBuffer> table = sampler_table_buffer(&sampler_tables, dev, samplers, (unsigned)si->ntex);
+        if (!table) { LOG("FATAL: Metal sampler table allocation failed\n"); abort(); }
+        if (stage == 0) [enc setVertexBuffer:table offset:0 atIndex:si->sampler_table_index];
+        else [enc setFragmentBuffer:table offset:0 atIndex:si->sampler_table_index];
+    }
+    if (bind_start) stat_texture_bind_ns += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - bind_start;
 }
 
 static void bind_cbufs(int stage, ShaderInfo *si) {
@@ -1462,8 +1533,15 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
         [ce setBuffer:ring offset:off atIndex:k];
     }
     CST("gmem");
-    if (si->uses_gmem) [ce setBuffer:g_guest_buffer offset:0 atIndex:GMEM_BUFFER_INDEX];
+    if (si->uses_gmem) {
+#ifdef LARECOMP_COMPACT_GUEST
+        gpu_bind_compute(ce, si->writes_gmem);
+#else
+        [ce setBuffer:g_guest_buffer offset:0 atIndex:GMEM_BUFFER_INDEX];
+#endif
+    }
     CST("textures");
+    __unsafe_unretained id<MTLSamplerState> compute_samplers[32];
     for (int i = 0; i < si->ntex; i++) {
         ShaderTexture *st_ = &si->tex[i];
         int slot = ((int)st_->handle_offset - 0x20) / 8;
@@ -1487,7 +1565,14 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
         }
         if (h && st.spool && tsc < (uint32_t)st.spool->count) smp = sampler_for(&((NvnSamplerDesc *)st.spool->entries)[tsc]);
         [ce setTexture:tex ? tex : dummy_texture(st_->type) atIndex:i];
-        [ce setSamplerState:smp ? smp : default_sampler() atIndex:i];
+        smp = smp ? smp : default_sampler();
+        if (si->uses_sampler_table) compute_samplers[i] = smp;
+        else [ce setSamplerState:smp atIndex:i];
+    }
+    if (si->uses_sampler_table) {
+        id<MTLBuffer> table = sampler_table_buffer(&sampler_tables, dev, compute_samplers, (unsigned)si->ntex);
+        if (!table) { LOG("FATAL: Metal compute sampler table allocation failed\n"); abort(); }
+        [ce setBuffer:table offset:0 atIndex:si->sampler_table_index];
     }
     if (si->uses_rscale) {
         float rs[65][4] = {{1, 1, 0, 0}};
@@ -1682,6 +1767,23 @@ static void draw(CmdRec *r, bool indexed) {
     for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) fkey.rt_kind[i] = (uint8_t)rt_kind(st.rt.color[i]->format);
     Prog *pr = get_program(st.program, &vkey, &fkey);
     if (!pr || !pr->ready) { stat_skipped++; return; }
+    {   // mirror mode (runtime/hle/mirror.c): the scene's composite into the window image is drawn mirrored - the
+        // unblended full-screen draw sampling an image the window's size (the window images also serve as scratch
+        // targets earlier in the frame: those draws sample smaller images; the HUD after it blends)
+        extern bool mirror_draw(bool composite);
+        bool composite = false;
+        if (st.rt.ncolor && st.rt.color[0] && renderer_texture_presented(st.rt.color[0]) && !(st.color_state[0] & 1) &&
+            r->x[2] <= 6 && st.viewport[0][0] == 0 && st.viewport[0][1] == 0 &&
+            st.viewport[0][2] >= st.rt.color[0]->width && st.viewport[0][3] >= st.rt.color[0]->height && pr->fi->ntex) {
+            NvnTexture *t0 = shader_texture_object(1, &pr->fi->tex[0]);
+            composite = t0 && t0->width == st.rt.color[0]->width && t0->height == st.rt.color[0]->height;
+        }
+        if (mirror_draw(composite)) {  // (the vertex flip mirrors a composite drawn with uvs, the fragment one a
+            vkey.flip_x = fkey.flip_x = true;  // composite reading pixel positions; get_program keys on vkey)
+            pr = get_program(st.program, &vkey, &fkey);
+            if (!pr || !pr->ready) { stat_skipped++; return; }
+        }
+    }
     {   // Interiors/dungeons draw a 16:9 backdrop quad over the still-rendered overworld: frames that
         // draw it are presented cropped to 16:9 (see backend_present).
         static uint64_t last_fs, last_hash;
@@ -1853,11 +1955,13 @@ static void draw(CmdRec *r, bool indexed) {
             cache[pk] = pending;
             NSString *k = [pk copy];
             double t0 = now_ms();
+            atomic_fetch_add(&pending_shader_jobs, 1);
             [dev newRenderPipelineStateWithDescriptor:pd completionHandler:^(id<MTLRenderPipelineState> ps, NSError *e) {
                 if (!ps) { static int n; if (n++ < 10) LOG("[metal] pipeline failed: %s\n", e.localizedDescription.UTF8String); }
                 @synchronized(ready_pipes) { ready_pipes[k] = ps ? (id)ps : (id)[NSNull null]; }
                 @synchronized(cache) { stat_compile_ms += now_ms() - t0; }
                 __atomic_fetch_add(&stat_compiles, 1, __ATOMIC_RELAXED);
+                atomic_fetch_sub(&pending_shader_jobs, 1);
             }];
             stat_skipped++;
             return;
@@ -1912,6 +2016,7 @@ static void draw(CmdRec *r, bool indexed) {
 
     // rasterizer
     uint8_t cull = st.poly[0];
+    if (vkey.flip_x) cull = 0;  // (mirror mode's composite: one full-screen quad, either winding)
     [enc setCullMode:cull == 1 ? MTLCullModeFront : cull == 2 ? MTLCullModeBack : MTLCullModeNone];
     bool ccw = st.poly[1] == 1;
     [enc setFrontFacingWinding:(ccw != vkey.flip_y) ? MTLWindingCounterClockwise : MTLWindingClockwise];
@@ -1936,7 +2041,13 @@ static void draw(CmdRec *r, bool indexed) {
     // resources
     bind_cbufs(0, pr->vi);
     bind_cbufs(1, pr->fi);
-    if (pr->vi->uses_gmem) [enc setVertexBuffer:g_guest_buffer offset:0 atIndex:GMEM_BUFFER_INDEX];
+    if (pr->vi->uses_gmem) {
+#ifdef LARECOMP_COMPACT_GUEST
+        gpu_bind_render(enc, true, pr->vi->writes_gmem);
+#else
+        [enc setVertexBuffer:g_guest_buffer offset:0 atIndex:GMEM_BUFFER_INDEX];
+#endif
+    }
     static id<MTLBuffer> dbgvs;
     bool dbg_this = maxwell_dbg_vs && (const uint8_t *)(uintptr_t)st.program->stages[0].code_addr == maxwell_dbg_vs;
     if (dbg_this) {
@@ -1944,7 +2055,13 @@ static void draw(CmdRec *r, bool indexed) {
         memset(dbgvs.contents, 0xff, 2 * 64 * 8 * 16);
         [enc setVertexBuffer:dbgvs offset:0 atIndex:DBG_VS_BUFFER_INDEX];
     }
-    if (pr->fi->uses_gmem) [enc setFragmentBuffer:g_guest_buffer offset:0 atIndex:GMEM_BUFFER_INDEX];
+    if (pr->fi->uses_gmem) {
+#ifdef LARECOMP_COMPACT_GUEST
+        gpu_bind_render(enc, false, pr->fi->writes_gmem);
+#else
+        [enc setFragmentBuffer:g_guest_buffer offset:0 atIndex:GMEM_BUFFER_INDEX];
+#endif
+    }
     bind_textures(0, pr->vi);
     bind_textures(1, pr->fi);
     extern bool pets_hide_item_cursor(void);  // (the cursor is on the companion card: runtime/hle/pets.c)
@@ -2020,9 +2137,10 @@ static void draw(CmdRec *r, bool indexed) {
     }
     apply_scissor();
     if (pr->fi->uses_rscale) {  // [0] = render target scale, [1 + i] = scale of texture i
-        float rs[65][4] = {{vp_sx, vp_sy, vp_ox, vp_oy}};
+        float rs[66][4] = {{vp_sx, vp_sy, vp_ox, vp_oy}};
         for (int i = 0; i < pr->fi->ntex && i < 64; i++) { rs[1 + i][0] = tex_sc[1][i][0]; rs[1 + i][1] = tex_sc[1][i][1]; }
-        [enc setFragmentBytes:rs length:(NSUInteger)(1 + pr->fi->ntex) * 16 atIndex:RSCALE_BUFFER_INDEX];
+        if (fkey.flip_x) rs[65][0] = (float)st.rt.color[0]->width;  // (mirror mode: the composite's width, guest pixels)
+        [enc setFragmentBytes:rs length:(NSUInteger)(fkey.flip_x ? 66 : 1 + pr->fi->ntex) * 16 atIndex:RSCALE_BUFFER_INDEX];
     }
     if (st.ubuf[0][2].addr && st.ubuf[0][2].size >= 48 && !(st.ubuf[0][2].addr & 3)) {  // cut bushes' items
         extern void pot_item_draw(float *m);                                                 // (runtime/hle/pot_glow.c)
@@ -2149,8 +2267,13 @@ static void draw(CmdRec *r, bool indexed) {
             uint32_t isz = itype == 1 ? 2 : 4;
             id<MTLBuffer> ib;
             uint64_t ioff;
+#ifdef LARECOMP_COMPACT_GUEST
+            if (count && (iaddr % isz) == 0) {
+                ib = gpu_guest_buffer(iaddr, (uint64_t)count * isz, &ioff);
+#else
             if (iaddr >= HEAP_BASE && iaddr + (uint64_t)count * isz <= HEAP_BASE + HEAP_MAX && (iaddr % isz) == 0) {
                 ib = g_guest_buffer; ioff = iaddr - HEAP_BASE;
+#endif
             } else {
                 ioff = ring_alloc((void *)(uintptr_t)iaddr, (uint64_t)count * isz); ib = ring;
             }
@@ -2349,11 +2472,16 @@ static void copy_texture_to_buffer(const TexRefRec *src, uint64_t dst) {
     id<MTLBlitCommandEncoder> b = [cb() blitCommandEncoder];
     if (renderer_pixel_format_bytes(tex.pixelFormat, fi->bpb) != fi->bpb) { [b endEncoding]; return; }
     bool array = tex.textureType == MTLTextureType2DArray || tex.textureType == MTLTextureTypeCube;
+    id<MTLBuffer> destination = g_guest_buffer;
+    uint64_t destination_offset = dst - HEAP_BASE;
+#ifdef LARECOMP_COMPACT_GUEST
+    destination = gpu_guest_buffer(dst, img * (uint64_t)rg[5], &destination_offset);
+#endif
     for (int z = 0; z < (array ? rg[5] : 1); z++)
         [b copyFromTexture:tex sourceSlice:array ? rg[2] + z : 0 sourceLevel:level
               sourceOrigin:MTLOriginMake(rg[0], rg[1], array ? 0 : rg[2])
-                sourceSize:MTLSizeMake(rg[3], rg[4], array ? 1 : rg[5]) toBuffer:g_guest_buffer
-         destinationOffset:dst - HEAP_BASE + (uint64_t)z * img destinationBytesPerRow:row destinationBytesPerImage:img];
+                sourceSize:MTLSizeMake(rg[3], rg[4], array ? 1 : rg[5]) toBuffer:destination
+         destinationOffset:destination_offset + (uint64_t)z * img destinationBytesPerRow:row destinationBytesPerImage:img];
     [b endEncoding];
     renderer_flush();  // the CPU may read the result right after the fence
 }
@@ -2695,7 +2823,8 @@ static void exec_list(uint64_t handle, int depth) {
             static uint32_t seen;
             uint32_t type = (uint32_t)r->x[0];
             if (type < 32 && !(seen & (1u << type))) { seen |= 1u << type; LOG("[nvn] ReportCounter type %u\n", type); }
-            if (out) { out[0] = 0; out[1] = SDL_GetTicksNS(); }
+            // (Switch GPU ticks, 614.4 MHz: the game converts the difference to ns itself - see the Vulkan exec.c)
+            if (out) { out[0] = 0; out[1] = (uint64_t)((unsigned __int128)plat_now_ns() * 384 / 625); }
             break;
         }
         case CMD_COPY_TEXTURE_TO_TEXTURE: {
@@ -2725,6 +2854,8 @@ static void exec_list(uint64_t handle, int depth) {
 // views, snapshots, bound state - so the next boot can't hit a stale entry. Metal's own shader cache stays warm.
 void renderer_reset(void) {
     renderer_flush();
+    texture_bindings_reset(&texture_bindings);
+    sampler_tables_reset(&sampler_tables);
     pthread_mutex_lock(&gone_lock);
     ngone = 0;
     pthread_mutex_unlock(&gone_lock);

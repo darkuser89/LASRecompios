@@ -16,6 +16,8 @@ import re
 import sys
 import types
 
+import underwater  # (the sunken seashells' flags)
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.normpath(os.path.join(HERE, '..', '..'))
 LAS = os.path.join(ROOT, 'third_party', 'LAS-Randomizer')
@@ -111,8 +113,9 @@ def build(seed_dir, romfs):
 
     region_cells = {}
     pos = {}
+    absent = set(settings.get('absent-locations', ()))  # (rooms the dungeon shuffle left out: not in the game)
     for name, v in logic.items():
-        if v.get('type') != 'item' or name.startswith('starting-'):
+        if v.get('type') != 'item' or name.startswith('starting-') or name in absent:
             continue
         lr = loc_rooms.get(name, {})
         room, level = lr.get('room'), lr.get('level')
@@ -155,6 +158,8 @@ def build(seed_dir, romfs):
                 pass
             elif name in getattr(las_data, 'HEART_FLAGS', {}):
                 flag = flags.get(las_data.HEART_FLAGS[name], -1)
+            elif name in underwater.SHELL_FLAGS:  # (the sunken seashells' own flags: tools/rando/underwater.py)
+                flag = flags.get(underwater.SHELL_FLAGS[name], -1)
             elif room and sub in ('chest', 'standing', 'drop'):
                 r = room_file(room)
                 boxes = [a for a in r.actors if a.type == 0xf7] if r else []

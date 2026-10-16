@@ -92,13 +92,18 @@ static void deadline(struct timespec *ts, int64_t timeout_ns) {
 
 // Sleep on the current thread's condition. Returns false on timeout. Caller holds g_klock.
 static pthread_cond_t g_nothread_cond = PTHREAD_COND_INITIALIZER;
+// Time this thread spent blocked in the kernel (waits, sleeps): idle, not work. Frame pacing (exec.c vk_pace_frame)
+// takes the presenting thread's: a frame's busy time is its period minus this.
+__thread uint64_t g_blocked_ns;
+
 static bool kwait(int64_t timeout_ns, const struct timespec *ts) {
     pthread_cond_t *cv = t_cur ? &t_cur->cond : &g_nothread_cond;
-    if (timeout_ns < 0) {
-        pthread_cond_wait(cv, &g_klock);
-        return true;
-    }
-    return pthread_cond_timedwait(cv, &g_klock, ts) == 0;
+    uint64_t t0 = plat_now_ns();
+    bool r = true;
+    if (timeout_ns < 0) pthread_cond_wait(cv, &g_klock);
+    else r = pthread_cond_timedwait(cv, &g_klock, ts) == 0;
+    g_blocked_ns += plat_now_ns() - t0;
+    return r;
 }
 
 // ------------------------------------------------------------------ memory map
@@ -218,10 +223,18 @@ static KThread *thread_new(uint64_t entry, uint64_t arg, uint64_t stack_top, int
 static void thread_start(KThread *t) {
     pthread_attr_t attr;
     pthread_attr_init(&attr);
+#ifdef LARECOMP_COMPACT_GUEST
+    // Dozens of guest threads cannot each reserve the desktop's 256 MB stack in iPadOS's normal address space.
+    // The guest's stack is separate; these stacks hold only the translated C call frames. Leave enough
+    // unreserved address space for Metal's shader compiler mappings as well as the game itself.
+    pthread_attr_setstacksize(&attr, 4ull << 20);
+#else
     pthread_attr_setstacksize(&attr, 256ull << 20);  // guest recursion runs on the host stack
+#endif
     t->started = true;
-    pthread_create(&t->host, &attr, thread_main, t);
+    int err = pthread_create(&t->host, &attr, thread_main, t);
     pthread_attr_destroy(&attr);
+    if (err) FATAL("cannot start guest thread %llu: %s\n", (unsigned long long)t->id, strerror(err));
 }
 
 KThread *kernel_create_main_thread(uint64_t entry, uint64_t stack_size, int prio) {
@@ -453,6 +466,7 @@ static uint32_t svc_signal_to_address(uint64_t addr, uint32_t type, int32_t valu
 }
 
 // ------------------------------------------------------------------ wait synchronization
+
 static uint32_t svc_wait_synchronization(uint64_t handles_ptr, int32_t count, int64_t timeout, int32_t *index) {
     pthread_mutex_lock(&g_klock);
     struct timespec ts;
@@ -610,6 +624,7 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
             uint64_t d = end - now < 50000000 ? end - now : 50000000;
             struct timespec ts = {(time_t)(d / 1000000000), (long)(d % 1000000000)};
             nanosleep(&ts, NULL);
+            g_blocked_ns += plat_now_ns() - now;
         }
         break;
     }
@@ -736,7 +751,7 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
         case 3: v = ALIAS_SIZE; break;
         case 4: v = HEAP_BASE; break;
         case 5: v = HEAP_MAX; break;
-        case 6: case 21: v = 0xCD500000ull; break;  // application memory (3.2 GB, as on hardware)
+        case 6: case 21: v = HEAP_MAX < 0xCD500000ull ? HEAP_MAX : 0xCD500000ull; break;
         case 7: case 22: v = heap_size + 0x4000000; break;
         case 8: v = 0; break;
         case 9: v = 0; break;

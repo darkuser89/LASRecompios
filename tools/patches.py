@@ -100,6 +100,93 @@ def _warp_request(gen, a):
 for _a in WARP_REQUEST_SITES:
     PATCHES[_a] = _warp_request
 
+# Blaino's knock-out: Link flies up and a countdown (main+0xd97df0, +0xb8) starts MightPunchCrashOut - fade, then a
+# restart warp to his ring's start. On the Field there's no ring: no event (runtime/hle/miniboss.c), Link falls back.
+CRASHOUT_SITE = 0x7000d97e2c
+
+
+def _crashout(gen, a):
+    w = struct.unpack_from('<I', gen.nso.image, a - gen.base)[0]
+    assert w == 0xb900b81f, hex(w)  # str wzr, [x0, #0xb8]
+    return ('{ extern int rt_crashout_skip(void); ST32(c->x[0] + 0xb8, 0); if (rt_crashout_skip()) goto L_7000d97ea4; }'
+            f'  /* {a:#x}: str wzr, [x0, #0xb8] (Blaino knock-out: no crash-out event on the Field) */')
+
+
+PATCHES[CRASHOUT_SITE] = _crashout
+
+# Gohma on the Field (seeds): its moves walk / charge along a track - a heading of +-90 degrees (+0x15ec / +0x15f0,
+# the shared movement controller at +0x15c0 turns to it and the mover moves it, walls and all) toward a track end,
+# snapping onto the end when there (main+0x399550). The Field has no track: the heading points at Link and there is
+# no end - each move runs until its own timer (runtime/hle/miniboss.c).
+GOHMA_HEADING_SITES = (0x70003996e4, 0x700039a2c4)  # str w8, [x19, #0x15ec] (then the same to +0x15f0)
+GOHMA_ARRIVED_SITE = 0x700039957c  # ldr q0, [x19, #0x1600] (the track end, against Gohma's spot)
+
+
+def _gohma_heading(gen, a):
+    w = struct.unpack_from('<I', gen.nso.image, a - gen.base)[0]
+    assert w == 0xb915ee68, hex(w)  # str w8, [x19, #0x15ec]
+    return ('{ extern uint32_t rt_gohma_heading(uint64_t, uint32_t); '
+            'c->x[8] = rt_gohma_heading(c->x[19], (uint32_t)c->x[8]); ST32(c->x[19] + 0x15ec, (uint32_t)c->x[8]); }'
+            f'  /* {a:#x}: str w8, [x19, #0x15ec] (Gohma: heading at Link on the Field) */')
+
+
+def _gohma_arrived(gen, a):
+    w = struct.unpack_from('<I', gen.nso.image, a - gen.base)[0]
+    assert w == 0x3dc58260, hex(w)  # ldr q0, [x19, #0x1600]
+    return ('{ extern int rt_gohma_free(void); if (rt_gohma_free()) { c->x[0] = 0; goto L_70003995c0; } '
+            'memcpy(&c->v[0], (const void *)(uintptr_t)(c->x[19] + 0x1600), 16); }'
+            f'  /* {a:#x}: ldr q0, [x19, #0x1600] (Gohma: no track end on the Field) */')
+
+
+# Master Stalfos' body collision (CharaBodyCollision, main+0x1841c0 from his constructor) blocks Link - in his arena,
+# fine; on the Field Link couldn't damage-boost past him as past the other mini-bosses. Its flag (x6 -> sp+0x328) off
+# there (seeds, level Field).
+MSTALFOS_BODY_SITE = 0x70004b47c8  # mov w8, #1
+
+
+def _mstalfos_body(gen, a):
+    w = struct.unpack_from('<I', gen.nso.image, a - gen.base)[0]
+    assert w == 0x320003e8, hex(w)  # mov w8, #1
+    return ('{ extern int rt_gohma_free(void); c->x[8] = rt_gohma_free() ? 0 : 1; }'
+            f'  /* {a:#x}: mov w8, #1 (Master Stalfos body collision flag: off on the Field) */')
+
+
+PATCHES[MSTALFOS_BODY_SITE] = _mstalfos_body
+
+# Master Stalfos' jump (state 4 exec) sets its vertical speed to 6 * sin(phase) - height: an arc from his arena's floor
+# (height 0). On the Field the ground is higher - he dropped through it. There the arc starts from his takeoff height
+# (his movement component [+0x1160] + 0x28c, stored as the jump starts); in the arena that is 0 anyway.
+MSTALFOS_JUMP_SITE = 0x70004bde08  # fsub s0, s0, s1
+
+
+def _mstalfos_jump(gen, a):
+    w = struct.unpack_from('<I', gen.nso.image, a - gen.base)[0]
+    assert w == 0x1e213800, hex(w)  # fsub s0, s0, s1
+    return ('{ extern int rt_gohma_free(void); float a_, b_; memcpy(&a_, &c->v[0], 4); memcpy(&b_, &c->v[1], 4); '
+            'if (rt_gohma_free()) a_ += *(const float *)(uintptr_t)(LD64(c->x[19] + 0x1160) + 0x28c); '
+            '__uint128_t r_ = 0; a_ -= b_; memcpy(&r_, &a_, 4); c->v[0] = r_; }'
+            f'  /* {a:#x}: fsub s0, s0, s1 (Master Stalfos jump: arc from his takeoff height on the Field) */')
+
+
+PATCHES[MSTALFOS_JUMP_SITE] = _mstalfos_jump
+
+# Moblin Chief deletes himself in his init (main+0x1f8af0) unless a story bit is set (player status +0xac bit 7 - his
+# hideout's time); on the Field (seeds) that check is skipped. The defeated check before it stays.
+MCHIEF_STORY_SITE = 0x70001f8b30  # tbnz w8, #7, 0x70001f8b58
+
+
+def _mchief_story(gen, a):
+    w = struct.unpack_from('<I', gen.nso.image, a - gen.base)[0]
+    assert w == 0x37380148, hex(w)  # tbnz w8, #7, +0x28
+    return ('{ extern int rt_gohma_free(void); if (rt_gohma_free() || ((c->x[8] >> 7) & 1)) goto L_70001f8b58; }'
+            f'  /* {a:#x}: tbnz w8, #7 (Moblin Chief: no story check on the Field) */')
+
+
+PATCHES[MCHIEF_STORY_SITE] = _mchief_story
+for _a in GOHMA_HEADING_SITES:
+    PATCHES[_a] = _gohma_heading
+PATCHES[GOHMA_ARRIVED_SITE] = _gohma_arrived
+
 
 # Generated dungeons (runtime/hle/chamber.c): every level jump goes through the request processor main+0x81ba80
 # (x0 = request); its prologue reports the request so jumps into Tail Cave can be redirected.
@@ -509,6 +596,56 @@ for _a in TUNIC_CLEAR_SITES:
     PATCHES[_a] = _tunic_clear
 
 
+# Underwater checks (tools/rando/underwater.py; LAS 0.5 dev build's main+0x8c45b8 patch): the item actor's "should I
+# appear?" (main+0x8c4510) asks the inventory whether Link owns its item (bl HasItem(item +0x2e8, 1, index +0xbc)). The
+# sunken heart-piece actors hold randomized items now and hide by their own flag (Npc.gsheet layout condition), so for
+# heart-piece actors in seeds made with it the answer is "not owned" (runtime/hle/qol.c rt_underwater_skip_owned).
+UNDERWATER_OWNED_SITE = 0x70008c45b8
+
+
+def _underwater_owned(gen, a):
+    w = struct.unpack_from('<I', gen.nso.image, a - gen.base)[0]
+    assert w == 0x9400351e, hex(w)  # bl 0x8d1a30 (HasItem)
+    return ('{ extern int rt_underwater_skip_owned(uint64_t); if (rt_underwater_skip_owned(c->x[20])) c->x[0] = 0; '
+            'else { extern void f_70008d1a30(Cpu *); c->x[30] = 0x70008c45bcull; f_70008d1a30(c); } }'
+            f'  /* {a:#x}: bl HasItem (sunken heart pieces: their own flag decides) */')
+
+
+PATCHES[UNDERWATER_OWNED_SITE] = _underwater_owned
+
+# ...and their item models show underwater. Water is opaque here (its depth hides what's below): what's seen below the
+# surface is a second, low-resolution view the water samples, holding only models whose materials have the shader option
+# under_water - the heart piece's do, other items' don't. Model setup (main+0xff53d8 loop over a material's options)
+# reads it at 0xff54b4; in underwater-item seeds every material counts as under_water (as LAS-Randomizer's 0.5 dev
+# build does: its exlaunch mod writes mov w27, #1 here).
+UNDERWATER_VIEW_SITE = 0x7000ff54c0
+
+
+def _underwater_view(gen, a):
+    w = struct.unpack_from('<I', gen.nso.image, a - gen.base)[0]
+    assert w == 0x1a9f07fb, hex(w)  # cset w27, ne (under_water != 0)
+    return ('{ extern int rt_underwater_items(void); c->x[27] = (rt_underwater_items() || COND_NE(c)) ? 1u : 0u; }'
+            f'  /* {a:#x}: cset w27, ne (under_water: forced on for sunken items) */')
+
+
+PATCHES[UNDERWATER_VIEW_SITE] = _underwater_view
+
+# ...and picking one up gives only its own item (its event): the heart-piece actor's pickup (main+0x855a0, x19 = the
+# actor) would also add a heart piece (bl 0x89b960; LAS-Randomizer's 0.5 dev build NOPs it).
+UNDERWATER_PICKUP_SITE = 0x70000856e4
+
+
+def _underwater_pickup(gen, a):
+    w = struct.unpack_from('<I', gen.nso.image, a - gen.base)[0]
+    assert w == 0x9420589f, hex(w)  # bl 0x89b960
+    return ('{ extern int rt_underwater_skip_owned(uint64_t); if (!rt_underwater_skip_owned(c->x[19])) '
+            '{ extern void f_700089b960(Cpu *); c->x[30] = 0x70000856e8ull; f_700089b960(c); } }'
+            f'  /* {a:#x}: bl 0x89b960 (adds the heart piece: skipped for sunken items) */')
+
+
+PATCHES[UNDERWATER_PICKUP_SITE] = _underwater_pickup
+
+
 # Event actions with no handler: main+0x108e300 runs an event action through the actor's handler map; an entry whose
 # std::function is empty throws std::bad_function_call (0x108edc8), which the same function catches (catch
 # std::exception, landing pad 0x108f1c8 -> 0x108ef3c) to abort the event. Common.bfevfl's OcarinaWarpOut (every Manbo's
@@ -531,3 +668,20 @@ def _no_handler(gen, a):
 
 for _a in NO_HANDLER_SITES:
     PATCHES[_a] = _no_handler
+
+
+# Mirror mode: the HUD update places the in-world action prompt (main+0xeaa800: stp s2, s0, [x8, #0x30] = the
+# pane's translation x, y from the target's screen spot); x is mirrored there for that pane (runtime/hle/mirror.c).
+PROMPT_POS_SITE = 0x7000eab138
+
+
+def _prompt_pos(gen, a):
+    w = struct.unpack_from('<I', gen.nso.image, a - gen.base)[0]
+    assert w == 0x2d060102, hex(w)  # stp s2, s0, [x8, #0x30]
+    return ('{ extern float rt_prompt_x(uint64_t pane, float x); float px_, py_; memcpy(&px_, &c->v[2], 4); '
+            'memcpy(&py_, &c->v[0], 4); px_ = rt_prompt_x(c->x[8], px_); '
+            'memcpy((void *)(uintptr_t)(c->x[8] + 0x30), &px_, 4); memcpy((void *)(uintptr_t)(c->x[8] + 0x34), &py_, 4); }'
+            f'  /* {a:#x}: stp s2, s0, [x8, #0x30] (action prompt spot: mirror mode) */')
+
+
+PATCHES[PROMPT_POS_SITE] = _prompt_pos

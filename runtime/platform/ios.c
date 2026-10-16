@@ -4,10 +4,8 @@
 //   - no second process, ever: iOS apps cannot exec/posix_spawn a toolchain or a helper, so the update check, the
 //     on-device game-code build (runtime/gamebuild.c, not compiled in) and the seed generator are unavailable.
 //     plat_spawn() returns 0 so any accidental use fails loudly instead of hanging.
-//   - the guest window base is not the macOS one: iOS user VA ends at 0xFC0000000 (xnu osfmk/mach/arm/vm_param.h
-//     MACH_VM_MAX_ADDRESS_RAW), so an iOS build passes -DRT_BASE=0x400000000 to runtime/rt.h and generates the game
-//     code for that base (Makefile IOS_BASE_MAIN/SDK). macOS keeps 0x7000000000: everything below ~448 GB is
-//     reserved there.
+//   - LARECOMP_COMPACT_GUEST fits the normal large-allocation range at the original module base, so the
+//     runtime and the statically linked game code use identical module addresses.
 //   - a re-exec cannot recover from a guest-window collision, so that path just reports (runtime/main.c).
 #include <crt_externs.h>
 #include <dlfcn.h>
@@ -23,13 +21,25 @@
 #include <stdlib.h>
 #include <sys/mman.h>
 #include <sys/ucontext.h>
+#include <sys/sysctl.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 
 #include "../platform.h"
+#include "../settings.h"
 
 static mach_timebase_info_data_t tb;
 
 void plat_init(void) {
+    uint64_t physical = 0;
+    size_t physical_size = sizeof physical;
+    if (sysctlbyname("hw.memsize", &physical, &physical_size, NULL, 0) == 0 && physical <= (4ull << 30)) {
+        // Defaults only: settings_load() subsequently restores any explicit choice by the player.
+        // Half the width and height cuts the scalable render-target allocations to one quarter.
+        g_settings.res_mode = RES_Q50;
+        g_settings.upscaler = UPSCALE_METALFX;
+        fprintf(stderr, "[ios] low-memory defaults: half-resolution render targets, MetalFX spatial upscale\n");
+    }
     // iOS has no console: everything the runtime logs goes to stderr, which is the unified log when the app is
     // started from Xcode or `devicectl process launch --console`; runtime/paths.c also tees it into the data root.
     fprintf(stderr, "[ios] available memory before boot: %llu MB\n",
@@ -84,22 +94,74 @@ static void ios_probe_address_space(uint64_t want_lo, uint64_t want_hi) {
     fflush(stderr);
 }
 
+#ifdef LARECOMP_COMPACT_GUEST
+#include "../rt.h"
+#include "../hle/resource_cache.h"
+#include <stdatomic.h>
+static _Atomic bool ios_pageable_heap;
+static void ios_back_guest_heap(void) {
+    const char *e = getenv("LARECOMP_PAGEABLE_HEAP");
+    if (e && atoi(e) == 0) return;  // diagnostic opt-out; retain the full guest capacity either way
+    const char *dir = getenv("TMPDIR");
+    struct statvfs space;
+    // Preserve the original heap if temporary storage cannot accommodate both mapped heaps
+    // at their full size. ftruncate creates a sparse file; leave headroom for actual later writes.
+    uint64_t needed = HEAP_MAX + 0x53600000ull + (256ull << 20);
+    if (statvfs(dir && *dir ? dir : "/tmp", &space) != 0 ||
+        (uint64_t)space.f_bavail * space.f_frsize < needed) {
+        fprintf(stderr, "[ios] CPU heap: keeping anonymous backing (temporary storage budget unavailable)\n");
+        return;
+    }
+    void *address = (void *)(uintptr_t)HEAP_BASE;
+    ios_pageable_heap = resource_cache_map_at(address, HEAP_MAX) == address;
+    if (ios_pageable_heap)
+        fprintf(stderr, "[ios] CPU heap: %llu MB temporary file backing, unchanged guest capacity\n",
+                (unsigned long long)(HEAP_MAX >> 20));
+    else
+        fprintf(stderr, "[ios] CPU heap backing unavailable: %s; using original anonymous heap\n", strerror(errno));
+}
+void ios_memory_maintenance(void) {
+    if (ios_pageable_heap) {
+        if (msync((void *)(uintptr_t)HEAP_BASE, HEAP_MAX, MS_ASYNC) != 0) {
+            static int warned;
+            if (!warned++) fprintf(stderr, "[ios] CPU heap writeback: %s\n", strerror(errno));
+        }
+    }
+}
+#endif
+
 bool plat_reserve_guest(uint64_t lo, uint64_t hi) {
     // The whole window in one fixed allocation, like macOS (VM_FLAGS_FIXED fails instead of clobbering something
     // that is already mapped - mmap(MAP_FIXED) would silently replace it, and Darwin has no MAP_FIXED_NOREPLACE).
-    // Pages are unbacked until touched, so the 8.5 GB window costs nothing but addresses.
+    // Pages are unbacked until touched; the compact reservation costs addresses rather than physical RAM.
     vm_address_t a = (vm_address_t)lo;
-    if (vm_allocate(mach_task_self(), &a, (vm_size_t)(hi - lo), VM_FLAGS_FIXED) == KERN_SUCCESS) return true;
+    if (vm_allocate(mach_task_self(), &a, (vm_size_t)(hi - lo), VM_FLAGS_FIXED) == KERN_SUCCESS) {
+#ifdef LARECOMP_COMPACT_GUEST
+        ios_back_guest_heap();
+#endif
+        return true;
+    }
     ios_probe_address_space(lo, hi);
     _exit(1);  // (main.c would try to re-exec, which iOS cannot do)
 }
 
 bool plat_reset_guest(uint64_t lo, uint64_t hi) {  // in-place reboot: fresh zero pages over the whole window
     vm_address_t a = (vm_address_t)lo;
-    return vm_allocate(mach_task_self(), &a, (vm_size_t)(hi - lo), VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) == KERN_SUCCESS;
+    if (vm_allocate(mach_task_self(), &a, (vm_size_t)(hi - lo), VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) != KERN_SUCCESS) return false;
+#ifdef LARECOMP_COMPACT_GUEST
+    ios_pageable_heap = false;
+    ios_back_guest_heap();
+#endif
+    return true;
 }
 
 void plat_commit(uint64_t addr, uint64_t size) { (void)addr; (void)size; }
+
+// iOS has no CPU page-write tracking; callers use the conservative fallback.
+int plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, int max, uint64_t *page) {
+    (void)addr; (void)size; (void)pages; (void)max; (void)page;
+    return -1;
+}
 
 int plat_protect(uint64_t addr, uint64_t size, int prot) {
     int p = prot == PLAT_PROT_NONE ? PROT_NONE : prot == PLAT_PROT_READ ? PROT_READ : PROT_READ | PROT_WRITE;

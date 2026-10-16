@@ -21,6 +21,9 @@
 #include <string.h>
 
 #include "shader.h"
+#ifdef LARECOMP_COMPACT_GUEST
+#include "../gpu_memory.h"
+#endif
 
 uint64_t maxwell_gmem_base, maxwell_gmem_size;
 const uint8_t *maxwell_dbg_code;
@@ -97,6 +100,7 @@ typedef struct {
     bool fail;
     bool branchy;  // program uses the pc state machine
     int ipa_mode;  // interpolation mode of the IPA being translated (-1 for plain loads)
+    int ipa_mul;   // its multiplier register (mode 1: the result is the "pass" value attr/w times this register)
     // GLSL (fields kept last: the MSL path's layout, including its out-of-range reg_used writes, is unchanged)
     bool glsl;               // emit Vulkan GLSL: dialect-specific constructs here, the rest via glsl_rewrite()
     bool uses_gmem_store;    // STG present: the gmem buffer is not readonly
@@ -262,7 +266,10 @@ static void attr_load(Ctx *c, int dst, uint32_t addr, const char *idx) {
         if (addr >= 0x70 && addr < 0x80) {
             c->uses_frag_coord = true;
             int comp = (addr >> 2) & 3;
-            if (comp < 2) {  // guest pixel units: the render target may be allocated larger
+            if (comp == 0 && c->key && c->key->flip_x) {  // mirror mode's composite: x mirrored (rscale[65].x = width)
+                c->uses_rscale = true;
+                strcpy(e, "as_type<uint>(rscale[65][0] - (in.pos[0] - rscale[0][2]) / rscale[0][0])");
+            } else if (comp < 2) {  // guest pixel units: the render target may be allocated larger
                 c->uses_rscale = true;
                 sprintf(e, "as_type<uint>((in.pos[%d] - rscale[0][%d]) / rscale[0][%d])", comp, comp + 2, comp);
             } else {
@@ -276,9 +283,14 @@ static void attr_load(Ctx *c, int dst, uint32_t addr, const char *idx) {
                 strcpy(e, comp == 3 ? "0x3f800000u" : "0u");  // not provided by the vertex shader
             } else {
                 c->in_attr_mask |= 1u << a;
-                // IPA "pass" yields attr/w (the shader multiplies by w itself); Metal gives attr.
+                // IPA "pass" yields attr/w (the shader multiplies by w itself); Metal gives attr. "multiply" is the
+                // pass value times a register - usually w (from the pass of position w: Metal's attr again), but a
+                // shader may pass its own (the Mysterious Woods mist: 1/(v4.w * pos.w), a projective screen lookup)
                 if (c->ipa_mode == 0) sprintf(e, "as_type<uint>(in.v%d[%d] * in.pos.w)", a, comp);
-                else sprintf(e, "as_type<uint>(in.v%d[%d])", a, comp);
+                else if (c->ipa_mode == 1 && c->ipa_mul != RZ) {
+                    char mb[16];
+                    sprintf(e, "as_type<uint>(in.v%d[%d] * in.pos.w * as_type<float>(%s))", a, comp, reg(c, c->ipa_mul, mb));
+                } else sprintf(e, "as_type<uint>(in.v%d[%d])", a, comp);
             }
         } else if (addr == 0x3FC) { c->uses_front_facing = true; strcpy(e, "(front_facing ? 0xFFFFFFFFu : 0u)"); }
         else if (addr == 0x2E0 || addr == 0x2E4) { sprintf(e, "as_type<uint>(point_coord[%d])", (addr >> 2) & 1); }
@@ -896,6 +908,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
             if (mode == 2) c->flat_mask |= 1u << at;
         }
         c->ipa_mode = mode;
+        c->ipa_mul = (int)bits(w, 20, 8);
         attr_load(c, d, addr, NULL);
         c->ipa_mode = -1;
         if (bits(w, 51, 1) && d != RZ) sp(&c->body, "    r%d = as_type<uint>(saturate(as_type<float>(r%d)));\n", d, d);
@@ -1451,18 +1464,71 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         bool store = bits(w, 51, 1);
         bool wide = bits(w, 45, 1);
         int size = (int)bits(w, 48, 3);
+        int nw = size == 5 ? 2 : size >= 6 ? 4 : 1;
         int64_t off = sbits(w, 20, 24);
         c->info->uses_gmem = true;
+        c->info->writes_gmem |= store;
         char addr[256];
         if (a == RZ) sprintf(addr, "ulong(%lld)", (long long)off);
         else if (wide) sprintf(addr, "((ulong(%s) << 32 | ulong(%s)) + ulong(%lld))", R(a + 1), R(a), (long long)off);
         else sprintf(addr, "(ulong(%s) + ulong(%lld))", R(a), (long long)off);
+#ifdef LARECOMP_COMPACT_GUEST
+        bool span = getenv("LARECOMP_GPU_LEGACY_LOADS") == NULL;
+        if (!c->glsl)
+            // Resolve an entire LDG/STG once. Only accesses crossing a segment boundary need the
+            // per-word fallback; the usual 64/128-bit path shares its lookup across all registers.
+            sp(&c->body, "    { ulong gpu_addr = %s; device uchar *gmem = gpu_guest_ptr(gmem_pages, gpu_addr, %du); ulong ga = 0; bool ok = gmem != nullptr;\n",
+               addr, span ? (size < 2 ? 1 : size < 4 ? 2 : nw * 4) : 1);
+        else
+#endif
         sp(&c->body, "    { ulong ga = %s - 0x%llxul; bool ok = ga < 0x%llxul;\n", addr,
            (unsigned long long)maxwell_gmem_base, (unsigned long long)maxwell_gmem_size);
         static const char *const ld_small[] = {"uint(gmem[ga])", "uint(int(char(gmem[ga])))",
                                                "uint(*(device ushort *)(gmem + ga))", "uint(int(*(device short *)(gmem + ga)))"};
-        int nw = size == 5 ? 2 : size >= 6 ? 4 : 1;
-        if (c->glsl) {  // gmem_.w[]: 32-bit words; sub-word accesses within the containing word
+        if (c->glsl && c->stage == STAGE_COMPUTE) {
+            // Compute (Vulkan): the guest heap is host memory across PCIe on a discrete GPU, and a shader storing to
+            // it in a loop crawls (the little chain chomps in Madam MeowMeow's house: ~4 ms a dispatch, ~0.07 ms without
+            // the heap stores). The dispatch's storage buffers are copied to a device-local buffer (gfast_, address
+            // table gmap: exec.c gfast_prepare) and back after it: loads and stores inside them use that copy.
+            // Anything outside the table goes to the heap as before.
+            c->info->uses_gmem_map = true;
+            static const char *const gl_small[] = {
+                "(%s >> (uint(ga & 3ul) * 8u)) & 0xFFu", "uint(sx8(%s >> (uint(ga & 3ul) * 8u)))",
+                "(%s >> (uint(ga & 2ul) * 8u)) & 0xFFFFu", "uint(sx16(%s >> (uint(ga & 2ul) * 8u)))"};
+            sp(&c->body, "      uint fw = ok ? gfind(uint(ga)) : 0xFFFFFFFFu;\n");
+            if (!store) {
+                if (size < 4) {
+                    if (d != RZ) {
+                        char fast[160], slow[160];
+                        snprintf(fast, sizeof fast, gl_small[size], "gfast_.w[fw]");
+                        snprintf(slow, sizeof slow, gl_small[size], "gmem_.w[uint(ga >> 2)]");
+                        c->reg_used[d] = 1;
+                        sp(&c->body, "      r%d = fw != 0xFFFFFFFFu ? %s : ok ? %s : 0u;\n", d, fast, slow);
+                    }
+                } else {
+                    for (int k = 0; k < nw; k++)
+                        if (d != RZ && d + k < RZ) {
+                            c->reg_used[d + k] = 1;
+                            sp(&c->body, "      r%d = fw != 0xFFFFFFFFu ? gfast_.w[fw + %du] : ok ? gmem_.w[uint(ga >> 2) + %du] : 0u;\n",
+                               d + k, k, k);
+                        }
+                }
+            } else {
+                c->uses_gmem_store = true;
+                c->info->uses_gmem_store = true;
+                if (size < 4) {
+                    uint32_t m = size < 2 ? 0xFFu : 0xFFFFu;
+                    const char *bm = size < 2 ? "3ul" : "2ul";
+                    sp(&c->body, "      if (ok) { uint sh = uint(ga & %s) * 8u; uint v = (%s & 0x%xu) << sh;\n", bm, R(d), m);
+                    sp(&c->body, "        if (fw != 0xFFFFFFFFu) { atomicAnd(gfast_.w[fw], ~(0x%xu << sh)); atomicOr(gfast_.w[fw], v); }\n", m);
+                    sp(&c->body, "        else { atomicAnd(gmem_.w[uint(ga >> 2)], ~(0x%xu << sh)); atomicOr(gmem_.w[uint(ga >> 2)], v); } }\n", m);
+                } else {
+                    for (int k = 0; k < nw; k++)
+                        sp(&c->body, "      if (fw != 0xFFFFFFFFu) gfast_.w[fw + %du] = %s; else if (ok) gmem_.w[uint(ga >> 2) + %du] = %s;\n", k,
+                           R(d == RZ ? RZ : d + k), k, R(d == RZ ? RZ : d + k));
+                }
+            }
+        } else if (c->glsl) {  // gmem_.w[]: 32-bit words; sub-word accesses within the containing word
             static const char *const gl_small[] = {
                 "(gmem_.w[uint(ga >> 2)] >> (uint(ga & 3ul) * 8u)) & 0xFFu",
                 "uint(sx8(gmem_.w[uint(ga >> 2)] >> (uint(ga & 3ul) * 8u)))",
@@ -1493,14 +1559,30 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
                 if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      r%d = ok ? %s : 0u;\n", d, ld_small[size]); }
             } else {
                 for (int k = 0; k < nw; k++)
-                    if (d != RZ && d + k < RZ) { c->reg_used[d + k] = 1; sp(&c->body, "      r%d = ok ? *(device uint *)(gmem + ga + %du) : 0u;\n", d + k, k * 4); }
+                    if (d != RZ && d + k < RZ) {
+                        c->reg_used[d + k] = 1;
+#ifdef LARECOMP_COMPACT_GUEST
+                        if (span)
+                            sp(&c->body, "      r%d = ok ? *(device uint *)(gmem + %du) : gpu_load32(gmem_pages, gpu_addr + %du);\n", d + k, k * 4, k * 4);
+                        else sp(&c->body, "      r%d = gpu_load32(gmem_pages, gpu_addr + %du);\n", d + k, k * 4);
+#else
+                        sp(&c->body, "      r%d = ok ? *(device uint *)(gmem + ga + %du) : 0u;\n", d + k, k * 4);
+#endif
+                    }
             }
         } else {
             if (size == 0 || size == 1) sp(&c->body, "      if (ok) gmem[ga] = uchar(%s);\n", R(d));
             else if (size == 2 || size == 3) sp(&c->body, "      if (ok) *(device ushort *)(gmem + ga) = ushort(%s);\n", R(d));
             else
                 for (int k = 0; k < nw; k++)
+#ifdef LARECOMP_COMPACT_GUEST
+                    if (span)
+                        sp(&c->body, "      if (ok) *(device uint *)(gmem + %du) = %s; else gpu_store32(gmem_pages, gpu_addr + %du, %s);\n",
+                           k * 4, R(d == RZ ? RZ : d + k), k * 4, R(d == RZ ? RZ : d + k));
+                    else sp(&c->body, "      gpu_store32(gmem_pages, gpu_addr + %du, %s);\n", k * 4, R(d == RZ ? RZ : d + k));
+#else
                     sp(&c->body, "      if (ok) *(device uint *)(gmem + ga + %du) = %s;\n", k * 4, R(d == RZ ? RZ : d + k));
+#endif
         }
         sp(&c->body, "    }\n");
     } else if (emit_half(c, w)) {
@@ -1821,8 +1903,16 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     if (info->uses_gmem)
         sp(&s, "layout(std430, set = %d, binding = %d) %sbuffer GMem { uint w[]; } gmem_;\n", set, GMEM_BUFFER_INDEX,
            c->uses_gmem_store ? "" : "readonly ");
+    if (info->uses_gmem_map) {  // (compute) the dispatch's storage buffers, device-local: gmap[i] = heap offset, size, word
+        sp(&s, "layout(std140, set = %d, binding = %d) uniform GMap { uvec4 gmap[%d]; };\n", set, GMAP_BUFFER_INDEX, GMAP_MAX + 1);
+        sp(&s, "layout(std430, set = %d, binding = %d) %sbuffer GFast { uint w[]; } gfast_;\n", set, GFAST_BUFFER_INDEX,
+           c->uses_gmem_store ? "" : "readonly ");
+        sp(&s, "uint gfind(uint g) { uint n = gmap[%d].x; for (uint i = 0u; i < n; i++) { uint o = g - gmap[i].x; "
+               "if (g >= gmap[i].x && o < gmap[i].y) return gmap[i].z + (o >> 2); } return 0xFFFFFFFFu; }\n", GMAP_MAX);
+    }
     if (c->uses_rscale && stage != STAGE_VERTEX) {
-        sp(&s, "layout(std140, set = %d, binding = 18) uniform RScale { vec4 rscale[65]; };\n", set);
+        sp(&s, "layout(std140, set = %d, binding = 18) uniform RScale { vec4 rscale[%d]; };\n", set,
+           key && key->flip_x ? 66 : 65);  // ([65]: mirror mode's render target width)
         info->uses_rscale = true;
     }
     bool tint = stage == STAGE_FRAGMENT && !dbg && (c->omap_target & 0x7) == 0x7 && (!key || key->rt_kind[0] == 0);
@@ -1898,6 +1988,7 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     free(body.buf);
     if (stage == STAGE_VERTEX) {
         if (key && key->flip_y) sp(&s, "  gl_Position.y = -gl_Position.y;\n");
+        if (key && key->flip_x) sp(&s, "  gl_Position.x = -gl_Position.x;\n");
         if (key && key->depth_minus_one) sp(&s, "  gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5f;\n");
     } else if (stage == STAGE_FRAGMENT) {
         int r = 0;
@@ -2022,6 +2113,21 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     // ---------------------------------------------------------- MSL source
     Str s = {0};
     sp(&s, "#include <metal_stdlib>\nusing namespace metal;\n");
+    if (info->ntex > 16) {
+        info->uses_sampler_table = true;
+        int slot = 16;
+        while (slot >= 0 && (info->cbuf_mask & (1u << slot))) slot--;
+        if (slot < 0) {
+            fail(c, "no unused constant-buffer slot for sampler table");
+            free(s.buf); free(c->body.buf); free(c);
+            return info;
+        }
+        info->sampler_table_index = (uint8_t)slot;
+        sp(&s, "struct SamplerTable { array<sampler, 32> slots [[id(0)]]; };\n");
+    }
+#ifdef LARECOMP_COMPACT_GUEST
+    if (info->uses_gmem) sp(&s, "%s", GPU_MEMORY_MSL);
+#endif
     sp(&s, "static inline uint cbr(constant uint4 *cb, uint off) { return cb[off >> 4][(off >> 2) & 3]; }\n");
     sp(&s, "static inline uint bfe_u(uint v, uint ctl) { uint pos = ctl & 0xFFu, len = (ctl >> 8) & 0xFFu; if (len == 0u) return 0u; if (pos >= 32u) return 0u; return extract_bits(v, pos, min(len, 32u - pos)); }\n");
     sp(&s, "static inline uint bfe_s(uint v, uint ctl) { uint pos = ctl & 0xFFu, len = (ctl >> 8) & 0xFFu; if (len == 0u) return 0u; if (pos >= 32u) return (int(v) < 0) ? 0xFFFFFFFFu : 0u; return uint(extract_bits(int(v), pos, min(len, 32u - pos))); }\n");
@@ -2035,7 +2141,10 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
            " if (e == 31u) return as_type<float>(s | 0x7F800000u | (m << 13));"
            " return as_type<float>(s | ((e + 112u) << 23) | (m << 13)); }\n");
     sp(&s, "static inline float2 hx(uint v, uint swz) { if (swz == 1u) return float2(as_type<float>(v)); float2 h = float2(h2f(v & 0xFFFFu), h2f(v >> 16)); return swz == 2u ? h.xx : swz == 3u ? h.yy : h; }\n");
-    sp(&s, "static inline uint hpack(float2 r, uint merge, uint old) { if (merge == 1u) return as_type<uint>(r.x); uint lo = uint(as_type<ushort>(half(r.x))), hi = uint(as_type<ushort>(half(r.y))); if (merge == 2u) return (old & 0xFFFF0000u) | lo; if (merge == 3u) return (old & 0xFFFFu) | (hi << 16); return lo | (hi << 16); }\n");
+    // merges on half2 lanes rather than with integer masks: on an M1 (macOS 15.0.1) the Metal compiler miscompiled
+    // (old & 0xFFFF0000u) | lo in Link's body shader - the merged low half read back as a constant 512.0 and Link
+    // rendered white. Same bits either way.
+    sp(&s, "static inline uint hpack(float2 r, uint merge, uint old) { if (merge == 1u) return as_type<uint>(r.x); half2 o = as_type<half2>(old), n = half2(r); if (merge == 2u) o.x = n.x; else if (merge == 3u) o.y = n.y; else o = n; return as_type<uint>(o); }\n");
     sp(&s, "static inline uint prmt(uint a, uint b, uint sel) { uint r = 0; for (uint i = 0; i < 4; i++) { uint s = (sel >> (i * 4)) & 7u; uint byte = s < 4 ? (a >> (s * 8)) & 0xFFu : (b >> ((s - 4) * 8)) & 0xFFu; r |= byte << (i * 8); } return r; }\n");
 
     // inputs/outputs
@@ -2080,7 +2189,11 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
             args = (Str){0};  // (was a use after free + double free of args.buf)
             fail(c, "cbuf %d clashes with gmem", GMEM_BUFFER_INDEX);
         }
+#ifdef LARECOMP_COMPACT_GUEST
+        sp(&args, ", constant GPUMemory &gmem_pages [[buffer(%d)]]", GMEM_BUFFER_INDEX);
+#else
         sp(&args, ", device uchar *gmem [[buffer(%d)]]", GMEM_BUFFER_INDEX);
+#endif
     }
     if (c->uses_rscale && stage != STAGE_VERTEX) {
         sp(&args, ", constant float4 *rscale [[buffer(18)]]");
@@ -2096,9 +2209,12 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     for (int i = 0; i < info->ntex; i++) {
         ShaderTexture *t = &info->tex[i];
         const char *tn = tex_type_name(t->type);
-        if (t->shadow) sp(&args, ", depth%s<float> t%d [[texture(%d)]], sampler s%d [[sampler(%d)]]", tn, i, i, i, i);
-        else sp(&args, ", texture%s<float> t%d [[texture(%d)]], sampler s%d [[sampler(%d)]]", tn, i, i, i, i);
+        if (t->shadow) sp(&args, ", depth%s<float> t%d [[texture(%d)]]", tn, i, i);
+        else sp(&args, ", texture%s<float> t%d [[texture(%d)]]", tn, i, i);
+        if (!info->uses_sampler_table) sp(&args, ", sampler s%d [[sampler(%d)]]", i, i);
     }
+    if (info->uses_sampler_table)
+        sp(&args, ", constant SamplerTable &sampler_table [[buffer(%d)]]", info->sampler_table_index);
     if (stage == STAGE_VERTEX) {
         sp(&s, "vertex VOut main0(VIn in [[stage_in]], uint vid [[vertex_id]], uint iid [[instance_id]]%s%s) {\n",
            (maxwell_dbg_vs && blob == maxwell_dbg_vs) ? ", device float4 *dbgout [[buffer(29)]]" : "",
@@ -2114,6 +2230,8 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
            args.buf ? args.buf : "");
     }
     free(args.buf);
+    if (info->uses_sampler_table)
+        for (int i = 0; i < info->ntex; i++) sp(&s, "  sampler s%d = sampler_table.slots[%d];\n", i, i);
     for (int i = 0; i < 256; i++)
         if (c->reg_used[i]) sp(&s, "  uint r%d = 0;\n", i);
     for (int i = 0; i < 7; i++)
@@ -2135,6 +2253,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     }
     if (stage == STAGE_VERTEX) {
         if (key && key->flip_y) sp(&s, "  out.pos.y = -out.pos.y;\n");
+        if (key && key->flip_x) sp(&s, "  out.pos.x = -out.pos.x;\n");
         if (key && key->depth_minus_one) sp(&s, "  out.pos.z = (out.pos.z + out.pos.w) * 0.5f;\n");
         if (maxwell_dbg_vs && blob == maxwell_dbg_vs) sp(&s, "  if (iid < 64u && vid < 8u) { dbgout[iid * 8u + vid] = out.pos; dbgout[512u + iid * 8u + vid] = %s; }\n", (c->out_attr_mask & 2u) ? "out.v1" : "float4(0)");
         sp(&s, "  return out;\n}\n");

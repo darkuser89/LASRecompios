@@ -1,16 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- The emulated machine's memory needs more than iOS gives an app by default: the guest heap is a 3.25 GB window
-     (runtime/rt.h HEAP_MAX) whose pages are only backed when the game touches them, plus the GPU's copy of the
-     textures. "Increased Memory Limit" is the documented way to ask for the larger jetsam budget on iPads that
-     support it (os_proc_available_memory() reports what is actually granted).
-     Extended Virtual Addressing is deliberately NOT requested: the iOS build relocates the guest window below the
-     default 67.6 GB VA limit (Makefile IOS_BASE_MAIN), so no approval-gated entitlement is needed. -->
+<!-- The compact iOS runtime fits the Air 4's normal address space and memory budget.
+     Keep signing compatible with Personal Teams: neither extended virtual addressing nor an increased memory
+     limit is required. The device probe measures the actual limits before a new device is supported. -->
 <plist version="1.0">
 <dict>
-    <key>com.apple.developer.kernel.increased-memory-limit</key><true/>
-    <!-- The guest window is one fixed 12.5 GB reservation (runtime/rt.h), which needs more address space than an
-         iOS app gets by default; this entitlement is what raises the limit (xnu: EXTENDED_USER_VA_SUPPORT). -->
-    <key>com.apple.developer.kernel.extended-virtual-addressing</key><true/>
 </dict>
 </plist>

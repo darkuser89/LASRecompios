@@ -1,6 +1,8 @@
 #!/bin/bash
-# make smoketest (tools/linux/smoketest.sh [AppImage]): release check of the x86-64 AppImage on this machine, in three
-# launches of the AppImage itself (default build/dist/LAS_Recomp-<version>-x86_64.AppImage):
+# make smoketest (tools/linux/smoketest.sh [AppImage]): release check of the x86-64 AppImage on this machine, in four
+# launches of the AppImage itself (default build/dist/LAS Recomp-<version>-linux-x86_64.AppImage):
+#   0. setup, as the start screen's Set up does it: this checkout's extracted/ (exefs, romfs) into an empty data folder,
+#      and the game code built from it with the bundled generator and compiler (runtime/gamebuild.c)
 #   1. start screen: rendered with the game files found ("Game files ready")
 #   2. one game session from a test save: into the game, then warps around the overworld and to every dungeon's
 #      entrance, a screenshot after each; the log must show each level loaded and no crash, the screenshots not black
@@ -8,14 +10,14 @@
 #      save on it until Link is in a level; then close and delete the seed
 # Result: build/smoke/report.txt (PASS / FAIL per check), build/smoke/sheet.png (every screenshot, labelled) and the
 # screenshots in build/smoke/shots/. Exit status 0 = ready for release.
-# Uses this checkout's extracted/ and a test save that is never in git: $LARECOMP_SMOKE_SAVE (a save folder with
+# Uses this checkout's extracted/ (as the folder a player picks) and a test save that is never in git: $LARECOMP_SMOKE_SAVE (a save folder with
 # save_0/, default ~/.local/share/lasrecomp-smoketest/save). Make one by starting a new game once (any build, data
 # folder's save/) and copying that save/ there. Nothing in ~/.local/share/lasrecomp is used or changed.
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 REPO=$PWD
 VERSION=$(sed -n 's/^#define LARECOMP_VERSION "\(.*\)"/\1/p' runtime/ui/launcher.mm)
-APP=$(realpath "${1:-build/dist/LAS_Recomp-$VERSION-x86_64.AppImage}")
+APP=$(realpath "${1:-build/dist/LAS Recomp-$VERSION-linux-x86_64.AppImage}")
 SAVE=${LARECOMP_SMOKE_SAVE:-$HOME/.local/share/lasrecomp-smoketest/save}
 O=$REPO/build/smoke
 [ -x "$APP" ] || { echo "smoketest: no AppImage at $APP (make appimage)"; exit 2; }
@@ -23,7 +25,6 @@ O=$REPO/build/smoke
 [ -d extracted/romfs ] || { echo "smoketest: no extracted/ game files in this checkout"; exit 2; }
 
 rm -rf "$O" && mkdir -p "$O/root/build" "$O/shots"
-ln -s "$REPO/extracted" "$O/root/extracted"
 cp -R "$SAVE" "$O/save"
 # test runs: no update check, no sound, a data folder of their own (runtime/paths.h), the AppImage run without FUSE
 export LARECOMP_DATA_ROOT=$O/root LARECOMP_SAVE_DIR=$O/save LARECOMP_SETTINGS=$O/root/larecomp.ini \
@@ -57,6 +58,18 @@ wait_app() {  # seconds: status 0 = the game ended by itself in time, else it is
     stop_app
     return 1
 }
+
+# ---- 0. setup (headless: LARECOMP_LAUNCHER_EXTRACT runs the start screen's Set up, logs the result and exits)
+t0=$(date +%s)
+start_app LARECOMP_LAUNCHER_EXTRACT="$REPO/extracted"
+wait_app 1800
+mv "$O/root/lasrecomp.log" "$O/setup.log" 2>/dev/null
+lib=$(ls "$O/root/extracted"/lasgame.* 2>/dev/null | head -1)
+if grep -q '\[launcher\] setup: .* -> READY' "$O/setup.log" && [ -n "$lib" ]; then
+    report PASS "setup: game files and game code built ($(( $(date +%s) - t0 )) s, $(basename "$lib") $(du -m "$lib" | cut -f1) MB)"
+else
+    report FAIL "setup: $(grep -m1 '\[launcher\] setup:' "$O/setup.log" || echo 'no result') (see build/smoke/setup.log)"
+fi
 
 # ---- 1. start screen
 # (no terminal: the app logs to lasrecomp.log in its data folder, runtime/platform/linux.c)
@@ -115,7 +128,7 @@ for i in "${!WARPS[@]}"; do
     [ -f "$shot" ] && cp "$shot" "$out"
     # loaded = the renderer's periodic line names the level after the jump to it
     if ! grep -q "\[warp\] jumping to $lvl / $loc" "$L"; then report FAIL "$name: warp not taken"
-    elif ! sed -n "/\[warp\] jumping to $lvl \/ $loc/,\$p" "$L" | grep -q " level $lvl "; then report FAIL "$name: $lvl never loaded"
+    elif ! sed -n "/\[warp\] jumping to $lvl \/ $loc/,\$p" "$L" | grep -c " level $lvl " >/dev/null; then report FAIL "$name: $lvl never loaded"
     elif [ ! -f "$out" ]; then report FAIL "$name: no screenshot"
     elif [ "$(dark "$out")" = 1 ]; then report FAIL "$name: screenshot is black"
     else report PASS "$name ($lvl / $loc)"; fi
@@ -138,7 +151,7 @@ start_app LARECOMP_NO_LAUNCHER=1 LARECOMP_INPUT="${IN%,}" LARECOMP_MENU_AT=7000 
     LARECOMP_RANDO_GEN_TEST=$SEED LARECOMP_RANDO_GEN_SHOTS="$O/shots/17_seed" LARECOMP_SCREENSHOT_EVERY=120
 L=$O/root/lasrecomp.log
 in_seed() {  # after the switch: the seed active, then the renderer reports a level (not the title screen, "-")
-    sed -n "/\[rando\] seed \"$SEED\" active/,\$p" "$L" 2>/dev/null | grep -qE ' level [A-Za-z0-9_]+ \('
+    sed -n "/\[rando\] seed \"$SEED\" active/,\$p" "$L" 2>/dev/null | grep -cE ' level [A-Za-z0-9_]+ \(' >/dev/null
 }
 for i in $(seq 1 300); do  # (10 minutes: generation takes about a minute)
     app_alive || break

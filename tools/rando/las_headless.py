@@ -280,8 +280,9 @@ def main():
         import random as _random
         import entrance_logic as el
         ed = el.load()
-        ent_doors = el.pool(ed)
         decoupled = bool(settings.get('entrance-decoupled', False))
+        # (decoupled with the desert shut by the sleeping Walrus: its doors stay vanilla - entrance_logic.pool)
+        ent_doors = el.pool(ed, ('desert',) if decoupled and not settings.get('open-desert', True) else ())
         ent_entry, ent_exit = el.shuffle(ent_doors, decoupled, _random.Random(f"{settings['seed']}-entrances"))
         extra = {k: list(v) for k, v in sanity_inside.items()}
         lv_door = {d['dest_level']: d['id'] for d in ent_doors}
@@ -332,11 +333,16 @@ def main():
         cat = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'room_catalog.json')))
         extra = {name: p['room'] for name, p in pot_locs.items() if p.get('room')}
         base = (copy.deepcopy(logic_defs), copy.deepcopy(item_defs), copy.deepcopy(settings))
+        layouts = jumps = None
         for attempt in range(40):  # a layout whose dungeons can't be filled: the next one (same seed ID, same result)
             sub = settings['seed'] if attempt == 0 else f"{settings['seed']}~{attempt}"
             if room_mode in ('chaos', 'madness'):  # (Madness: Chaos with one-way doorways)
-                layouts, jumps = dungeon_gen.plan_all_chaos(cat, sub, romfs, madness=room_mode == 'madness',
-                                                              settings=settings)
+                try:
+                    layouts, jumps = dungeon_gen.plan_all_chaos(cat, sub, romfs, madness=room_mode == 'madness',
+                                                                  settings=settings)
+                except RuntimeError as e:  # (no round left every dungeon room for its keys and items: next one)
+                    print('room layout:', e, '- planning another', flush=True)
+                    continue
                 logic_rows = jumps
             else:
                 layouts, jumps = dungeon_gen.plan_all(cat, sub, romfs), None
@@ -348,6 +354,8 @@ def main():
             if not why:
                 break
             print('room layout can\'t be filled -', why, '- planning another', flush=True)
+        if layouts is None:
+            raise RuntimeError('no dungeon room layout for this seed')
         room_plan = (layouts, jumps)
         if os.environ.get('LARECOMP_PLAN_ONLY'):  # (test: layouts + room logic only; =<names>: print those conditions)
             for k in os.environ['LARECOMP_PLAN_ONLY'].split(','):
@@ -445,7 +453,8 @@ def main():
     for k in [k for k, v in sh.logic_defs.items() if v.get('_check_only')]:
         del sh.logic_defs[k]
     missing = [i for i in playthrough.INSTRUMENTS if not access.get(i)]
-    locs = [k for k, v in sh.logic_defs.items() if v.get('type') == 'item']
+    absent = settings.get('absent-locations', set())  # (rooms the dungeon shuffle left out: not in the game)
+    locs = [k for k, v in sh.logic_defs.items() if v.get('type') == 'item' and k not in absent]
     unreached = [k for k in locs if k not in seen]
     print('playthrough:', 'all instruments reachable' if not missing else f'MISSING {missing}',
           f'- {len(locs) - len(unreached)}/{len(locs)} item locations reachable', flush=True)
@@ -580,12 +589,26 @@ def main():
         with open(os.path.join(out_dir, f'digs_{settings["seed"]}.txt'), 'w') as f:
             f.write('Digs:\n' + '\n'.join(lines) + '\n')
         print('digs placed:', len(lines), flush=True)
+    import underwater  # sunken heart pieces / seashells: their randomized item, its model, still dived for
+    from RandomizerCore.Tools import event_tools as _uw_ev, leb as _uw_leb
+    from RandomizerCore.Randomizers import item_get as _uw_get, data as _uw_data
+    print('underwater:', ', '.join(underwater.apply(mods, out_dir, romfs, _uw_leb, _uw_ev, _ot, _uw_get, _uw_data)),
+          flush=True)
+    if settings.get('enemy-minibosses'):  # the Field's walls for roaming mini-bosses (tools/rando/roam.py)
+        import roam
+        print('roam:', roam.write(out_dir, _uw_leb, romfs), flush=True)
+        import miniboss_guard  # (copies of a mini-boss whose flow gives a check don't give it again)
+        print('miniboss guard:', miniboss_guard.apply(out_dir, romfs, _uw_leb, _uw_ev, _ot, settings), flush=True)
+    import bomb_bag_text  # (after every flow edit, digs too) found bombs: "You found your Bomb Bag!"
+    print('bomb bag text:', bomb_bag_text.apply(out_dir, romfs, settings), flush=True)
     print('flags.tsv:', seed_tables.write_flags(out_dir, _ot, romfs), flush=True)
     with open(os.path.join(out_dir, 'settings.json'), 'w') as f:
         s = dict(settings)
         s['excluded-locations'] = sorted(s['excluded-locations'])
+        s['absent-locations'] = sorted(s.get('absent-locations', ()))
         s['escape-bottle'] = True  # (runtime/hle/escape.c: older seeds keep three plain bottles)
         s['ghost-item'] = 'ghost' in pets  # (runtime/hle/pets.c: older seeds' Ghost follows Link)
+        s['underwater-items'] = True  # (runtime: the sunken heart-piece actors don't hide for an owned heart piece)
         json.dump(s, f, indent=1)
     stage('Building the check tracker', 0.99)
     import tracker

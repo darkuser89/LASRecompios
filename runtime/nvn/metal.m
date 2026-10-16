@@ -22,6 +22,10 @@
 #include "nvn.h"
 #include "renderer.h"
 #include "texpatch.h"
+#include "bc_decode.h"
+#ifdef LARECOMP_COMPACT_GUEST
+#include "gpu_memory.h"
+#endif
 
 static id<MTLDevice> dev;
 static id<MTLCommandQueue> queue;
@@ -35,9 +39,19 @@ id<MTLBuffer> g_guest_buffer;  // wraps the guest heap so GPU addresses map to b
 uint64_t g_guest_buffer_base;
 
 // ================================================================== formats
-typedef struct { MTLPixelFormat pf; uint8_t expand_rgb; uint8_t force_alpha_one; } MtlFormat;
+typedef struct { MTLPixelFormat pf; uint8_t expand_rgb; uint8_t force_alpha_one; uint8_t decode_bc; } MtlFormat;
 
 static MtlFormat mtl_format(uint32_t f) {
+    if (f >= 0x41 && f <= 0x50 && (!dev.supportsBCTextureCompression || getenv("LARECOMP_SOFTWARE_BC"))) {
+        switch (f) {
+        case 0x49: return (MtlFormat){MTLPixelFormatR8Unorm, 0, 0, 1};
+        case 0x4A: return (MtlFormat){MTLPixelFormatR8Snorm, 0, 0, 1};
+        case 0x4B: return (MtlFormat){MTLPixelFormatRG8Unorm, 0, 0, 2};
+        case 0x4C: return (MtlFormat){getenv("LARECOMP_BC5_UNORM") ? MTLPixelFormatRG8Unorm : MTLPixelFormatRG8Snorm, 0, 0, 2};
+        case 0x4F: case 0x50: return (MtlFormat){MTLPixelFormatRGBA16Float, 0, 0, 8};
+        default: return (MtlFormat){(f >= 0x45 && f <= 0x48) || f == 0x4E ? MTLPixelFormatRGBA8Unorm_sRGB : MTLPixelFormatRGBA8Unorm, 0, 0, 4};
+        }
+    }
     switch (f) {
     case 0x01: return (MtlFormat){MTLPixelFormatR8Unorm};
     case 0x02: return (MtlFormat){MTLPixelFormatR8Snorm};
@@ -161,6 +175,7 @@ typedef struct {
     bool gpu_owned;     // written by the GPU (render target / copy dest): never re-uploaded
     bool uploaded;
     bool dynamic;        // contents changed after the first upload: verify fully every frame
+    uint64_t used_frame;  // last reference by the render queue (cold CPU-backed copies may be recreated)
     uint64_t data_hash, sample_hash;
     uint64_t checked_frame, full_frame;
     bool scalable;       // screen-shaped render target: allocated at the output resolution
@@ -178,12 +193,17 @@ typedef struct {
 // until a window resize reallocated them; user 2026-10-09). Dumped when the frame rate stays low.
 static NvnTexture *g_reg[16384];
 static int g_reg_n;
+static pthread_mutex_t g_reg_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_texture_evictions, g_texture_reloads, g_texture_evicted_bytes;
 static void reg_add(NvnTexture *t, TexBackend *b) {
-    if (b->reg || g_reg_n >= 16384) return;
-    g_reg[g_reg_n++] = t;
-    b->reg = g_reg_n;
+    pthread_mutex_lock(&g_reg_lock);
+    if (!b->reg && g_reg_n < 16384) {
+        g_reg[g_reg_n++] = t;
+        b->reg = g_reg_n;
+    }
+    pthread_mutex_unlock(&g_reg_lock);
 }
-static void reg_remove(TexBackend *b) {
+static void reg_remove(TexBackend *b) {  // g_reg_lock held by the finalizer
     if (!b->reg) return;
     int i = b->reg - 1;
     NvnTexture *last = g_reg[--g_reg_n];
@@ -192,6 +212,7 @@ static void reg_remove(TexBackend *b) {
     b->reg = 0;
 }
 static void dump_largest_textures(const char *why) {
+    pthread_mutex_lock(&g_reg_lock);
     int idx[16];
     uint64_t sz[16];
     int n = 0;
@@ -199,8 +220,8 @@ static void dump_largest_textures(const char *why) {
         TexBackend *b = g_reg[i] ? (TexBackend *)g_reg[i]->backend : NULL;
         if (!b || !b->tex) continue;
         uint64_t a = b->tex.allocatedSize;
+        if (n == 16 && a <= sz[15]) continue;
         int k = n < 16 ? n++ : 15;
-        if (k == 15 && n == 16 && a <= sz[15]) continue;
         while (k > 0 && sz[k - 1] < a) { sz[k] = sz[k - 1]; idx[k] = idx[k - 1]; k--; }
         sz[k] = a; idx[k] = i;
     }
@@ -212,6 +233,7 @@ static void dump_largest_textures(const char *why) {
             sz[k] / 1048576.0, t->width, t->height, t->format, t->target, t->levels, (unsigned long)b->tex.width,
             (unsigned long)b->tex.height, (unsigned long)b->tex.mipmapLevelCount, b->scalable, b->sx, b->sy, t->label);
     }
+    pthread_mutex_unlock(&g_reg_lock);
 }
 
 static uint64_t frames, total_frames;
@@ -324,13 +346,18 @@ void renderer_texture_gone(void *nvn_tex, void *mtl_tex);  // renderer.m
 static TexBackend *tex_backend(NvnTexture *t) {
     if (t->backend) {
         TexBackend *b = (TexBackend *)t->backend;
-        if (b->scalable && (b->sx != g_rs_x || b->sy != g_rs_y)) {  // output resolution changed: reallocate
+        if (!b->tex) {
+            create_backend_texture(t, b);
+            g_texture_reloads++;
+        } else if (b->scalable && (b->sx != g_rs_x || b->sy != g_rs_y)) {  // output resolution changed: reallocate
             release_backend_texture(t, b);
             create_backend_texture(t, b);
         }
+        b->used_frame = total_frames;
         return b;
     }
     TexBackend *b = calloc(1, sizeof *b);
+    b->used_frame = total_frames;
     b->scalable = tex_scalable(t);
     if (t->width == 1920 && t->height == 1080 && getenv("LARECOMP_LOG_SCALABLE"))
         LOG("[scale] 1920x1080 tex %p f%#x flags %#x target %u samples %u levels %u -> scalable %d (%s)\n", (void *)t, t->format,
@@ -397,18 +424,65 @@ static void create_backend_texture(NvnTexture *t, TexBackend *b) {
 }
 
 static void release_backend_texture(NvnTexture *t, TexBackend *b) {  // (also drops the renderer's views of it)
+    if (!b->tex) return;
     renderer_texture_gone(NULL, (__bridge void *)b->tex);
     g_tex_live--;
     g_tex_live_bytes -= b->tex.allocatedSize;
     CFBridgingRelease((__bridge CFTypeRef)b->tex);
+    b->tex = nil;
+    b->uploaded = false;
     (void)t;
 }
 
 void backend_texture_destroyed(NvnTexture *t) {
+    pthread_mutex_lock(&g_reg_lock);
     TexBackend *b = t->backend;
     renderer_texture_gone(t, NULL);  // its snapshot copy
     if (b) { reg_remove(b); release_backend_texture(t, b); free(b); }
     t->backend = NULL;
+    pthread_mutex_unlock(&g_reg_lock);
+}
+
+// The guest keeps many texture objects for unloaded areas. Their CPU bytes remain valid until
+// Finalize, so only the decoded Metal copy can be dropped. Never evict render targets, copies,
+// video, mutable glyph caches or textures used by the current/recent frames. Submitted command
+// buffers retain any older copies still in flight; the next sample recreates and fully uploads.
+static void trim_texture_cache(void) {
+    static long budget_mb = -1;
+    if (budget_mb < 0) {
+        const char *e = getenv("LARECOMP_TEXTURE_CACHE_MB");
+#if TARGET_OS_IPHONE
+        budget_mb = e ? atol(e) : 96;
+#else
+        budget_mb = e ? atol(e) : 0;
+#endif
+        if (budget_mb < 0) budget_mb = 0;
+        if (budget_mb > 4096) budget_mb = 4096;
+    }
+    if (!budget_mb || total_frames % 60) return;
+    uint64_t budget = (uint64_t)budget_mb << 20, resident = 0, dropped = 0;
+    unsigned count = 0;
+    pthread_mutex_lock(&g_reg_lock);
+    for (int i = 0; i < g_reg_n; i++) {
+        TexBackend *b = (TexBackend *)g_reg[i]->backend;
+        if (b && b->tex && !b->gpu_owned) resident += b->tex.allocatedSize;
+    }
+    for (int i = 0; i < g_reg_n && resident > budget; i++) {
+        NvnTexture *t = g_reg[i];
+        TexBackend *b = (TexBackend *)t->backend;
+        if (!b || !b->tex || b->gpu_owned || !b->uploaded || b->dynamic || !t->addr || t->target == 10 ||
+            total_frames - b->used_frame < 600) continue;
+        uint64_t size = b->tex.allocatedSize;
+        release_backend_texture(t, b);
+        resident -= size; dropped += size; count++;
+    }
+    g_texture_evictions += count; g_texture_evicted_bytes += dropped;
+    pthread_mutex_unlock(&g_reg_lock);
+    if ((count || getenv("LARECOMP_RENDER_STATS")) && (count || total_frames % 300 == 0))
+        LOG("[texcache] CPU-backed resident %llu MB, dropped %u (%llu MB), total %llu (%llu MB), reloads %llu\n",
+            (unsigned long long)(resident >> 20), count, (unsigned long long)(dropped >> 20),
+            (unsigned long long)g_texture_evictions, (unsigned long long)(g_texture_evicted_bytes >> 20),
+            (unsigned long long)g_texture_reloads);
 }
 
 static uint64_t g_frame_counter;  // presents so far (texture change detection runs once per frame)
@@ -496,6 +570,7 @@ static void upload_texture(NvnTexture *t, TexBackend *b, id<MTLBlitCommandEncode
             if (b->tp > 0 && layer == 0) texpatch_apply(b->tp - 1, lv, lin, l.w, l.h, row);
             uint8_t *data = lin;
             uint32_t out_row = row;
+            uint32_t out_rows = l.hb;
             static int bc5log;  // LARECOMP_LOG_BC5: endpoint bytes of BC5 (0x4B/0x4C) textures (unorm ~128 vs snorm ~0)
             if ((t->format == 0x4B || t->format == 0x4C) && lv == 0 && bc5log < 12 && getenv("LARECOMP_LOG_BC5")) {
                 bc5log++;
@@ -503,6 +578,14 @@ static void upload_texture(NvnTexture *t, TexBackend *b, id<MTLBlitCommandEncode
                 for (uint64_t i = 0; i + 16 <= sz; i += 16) { hist[lin[i] >> 6]++; hist[lin[i + 8] >> 6]++; }
                 LOG("[bc5] fmt %#x %ux%u endpoint0 quartiles (0-63,64-127,128-191,192-255): %d %d %d %d\n", t->format, l.w, l.h,
                     hist[0], hist[1], hist[2], hist[3]);
+            }
+            if (mf.decode_bc) {
+                data = decode_bc_level(lin, t->format, l, mf.decode_bc, mf.pf == MTLPixelFormatRG8Unorm);
+                if (!data) FATAL("out of memory decoding BC texture\n");
+                free(lin);
+                lin = data;
+                out_row = l.w * mf.decode_bc;
+                out_rows = l.h;
             }
             if (mf.expand_rgb && fi->bpb == 3) {  // RGB8 -> RGBA8
                 uint64_t n = (uint64_t)l.wb * l.hb * l.d;
@@ -515,7 +598,7 @@ static void upload_texture(NvnTexture *t, TexBackend *b, id<MTLBlitCommandEncode
                 free(lin);
                 lin = data;
             }
-            uint64_t out_sz = (uint64_t)out_row * l.hb * l.d;
+            uint64_t out_sz = (uint64_t)out_row * out_rows * l.d;
             id<MTLBuffer> staging = [dev newBufferWithBytes:data length:out_sz options:MTLResourceStorageModeShared];
             free(lin);
             // the copy stays inside the texture's level: one allocated at the internal resolution (16:9, render
@@ -525,7 +608,7 @@ static void upload_texture(NvnTexture *t, TexBackend *b, id<MTLBlitCommandEncode
             MTLSize size = MTLSizeMake(MIN((NSUInteger)l.w, lw), MIN((NSUInteger)l.h, lh), MIN((NSUInteger)l.d, ld));
             NSUInteger slice = layer;
             [blit copyFromBuffer:staging sourceOffset:0 sourceBytesPerRow:out_row
-                 sourceBytesPerImage:(NSUInteger)out_row * l.hb sourceSize:size toTexture:b->tex
+                 sourceBytesPerImage:(NSUInteger)out_row * out_rows sourceSize:size toTexture:b->tex
                     destinationSlice:slice destinationLevel:lv destinationOrigin:MTLOriginMake(0, 0, 0)];
         }
     }
@@ -588,9 +671,13 @@ void backend_init(void) {
     present_sampler = [dev newSamplerStateWithDescriptor:sd];
     // Wrap the guest heap: memory pools live there, and GPU addresses are guest addresses.
     g_guest_buffer_base = HEAP_BASE;
+#ifdef LARECOMP_COMPACT_GUEST
+    gpu_memory_init(dev);
+#else
     g_guest_buffer = [dev newBufferWithBytesNoCopy:(void *)HEAP_BASE length:HEAP_MAX
                                            options:MTLResourceStorageModeShared deallocator:nil];
     if (!g_guest_buffer) FATAL("cannot wrap guest heap in a Metal buffer (max %llu)\n", (uint64_t)dev.maxBufferLength);
+#endif
     renderer_init(dev);
     if (getenv("LARECOMP_ASPECT_TEST")) {  // experiment: widen the game's 16:9 aspect constant
         float *k = (float *)(uintptr_t)(MAIN_BASE + 0x16afba4ull);
@@ -598,7 +685,11 @@ void backend_init(void) {
         LOG("[aspect] constant %f -> %f\n", *k, (float)atof(getenv("LARECOMP_ASPECT_TEST")));
         *k = (float)atof(getenv("LARECOMP_ASPECT_TEST"));
     }
+#ifdef LARECOMP_COMPACT_GUEST
+    LOG("[metal] %s, CPU heap %llu MB, GPU pool mappings on demand (device maxBufferLength %llu MB, working set %llu MB)\n", dev.name.UTF8String,
+#else
     LOG("[metal] %s, heap buffer %llu MB (device maxBufferLength %llu MB, working set %llu MB)\n", dev.name.UTF8String,
+#endif
         (uint64_t)HEAP_MAX >> 20, (uint64_t)dev.maxBufferLength >> 20, (uint64_t)dev.recommendedMaxWorkingSetSize >> 20);
 }
 
@@ -619,14 +710,21 @@ void backend_reset(void) {
     renderer_reset();
     g_last_presented = NULL;
     g_guest_buffer = nil;
+#ifdef LARECOMP_COMPACT_GUEST
+    gpu_memory_reset();
+#endif
     LOG("[metal] reboot: %d textures released (%d left alive, %.0f MB)\n", n, g_tex_live, g_tex_live_bytes / 1048576.0);
 }
 
 void backend_guest_memory_reset(void) {
     if (!queue) return;
+#ifdef LARECOMP_COMPACT_GUEST
+    gpu_memory_init(dev);
+#else
     g_guest_buffer = [dev newBufferWithBytesNoCopy:(void *)HEAP_BASE length:HEAP_MAX
                                            options:MTLResourceStorageModeShared deallocator:nil];
     if (!g_guest_buffer) FATAL("cannot wrap guest heap in a Metal buffer\n");
+#endif
 }
 
 // The window goes black while the game is down (instead of holding its last frame).
@@ -893,6 +991,9 @@ void renderer_save_texture_alpha(id<MTLTexture> tex, const char *path) {
 }
 static float g_shot_crop[4] = {0, 0, 1, 1};  // presented crop of the current frame (screenshots match it)
 static bool g_save_upright;  // (set around saves of the window image: test shots under any name)
+static atomic_int g_window_shot_visible = -1;
+void renderer_window_shot_begin(void) { atomic_store(&g_window_shot_visible, -1); }
+int renderer_window_shot_visible(void) { return atomic_load(&g_window_shot_visible); }
 void renderer_save_texture(id<MTLTexture> tex, const char *path) {
     NSUInteger w = tex.width, h = tex.height;
     float shot_crop[4] = {0, 0, 1, 1};
@@ -945,6 +1046,17 @@ void renderer_save_texture(id<MTLTexture> tex, const char *path) {
     [cb waitUntilCompleted];
     uint8_t *px = malloc(w * h * 4);
     [dst getBytes:px bytesPerRow:w * 4 fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
+    if (g_save_upright) {
+        // Ignore the touch overlay and letterbox: a black transition is not evidence of a rendered scene.
+        NSUInteger visible = 0, sampled = 0;
+        for (NSUInteger y = h / 4; y < h * 3 / 4; y += 4)
+            for (NSUInteger x = w / 5; x < w * 4 / 5; x += 4) {
+                const uint8_t *p = px + (y * w + x) * 4;
+                visible += p[0] > 16 || p[1] > 16 || p[2] > 16;
+                sampled++;
+            }
+        atomic_store(&g_window_shot_visible, sampled && visible * 100 > sampled ? 1 : 0);
+    }
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
     CGContextRef ctx = CGBitmapContextCreate(px, w, h, 8, w * 4, cs, kCGImageAlphaPremultipliedLast);
     CGImageRef img = CGBitmapContextCreateImage(ctx);
@@ -1098,6 +1210,18 @@ void backend_present(NvnTexture *t) {
     frames++;
     total_frames++;
     g_frame_counter++;
+    trim_texture_cache();
+#if TARGET_OS_IPHONE && defined(LARECOMP_COMPACT_GUEST)
+    // Writeback can walk a large VM range. Keep it off the frame's submission thread and never
+    // queue overlapping work; the OS still manages the shared pages while they are in use.
+    static atomic_bool heap_writeback_pending;
+    if (total_frames % 120 == 0 && !atomic_exchange(&heap_writeback_pending, true))
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            extern void ios_memory_maintenance(void);
+            ios_memory_maintenance();
+            atomic_store(&heap_writeback_pending, false);
+        });
+#endif
     extern void input_frame(uint64_t frame);
     input_frame(total_frames);
     static long slow_ms = -1;  // LARECOMP_SLOW_FRAME_MS=<ms>: sleep per presented frame (simulate a slow machine)
@@ -1160,7 +1284,8 @@ void backend_present(NvnTexture *t) {
 // boots) or by ui_run; the game reuses the launcher's window.
 void ui_window_init(void) {
     if (window) return;
-    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+    // (no SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS here: on macOS reading controllers in the background opens them
+    // as HID devices, for which the system asks for Input Monitoring - "receive keystrokes from any application")
     settings_load();
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) FATAL("SDL_Init: %s\n", SDL_GetError());
     touch_pad_init();  // the on-screen pad is one more gamepad (runtime/ui/touch_pad.mm)
@@ -1193,7 +1318,8 @@ void ui_window_init(void) {
     dev = MTLCreateSystemDefaultDevice();
     layer.device = dev;
     layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
-    layer.framebufferOnly = getenv("LARECOMP_WINDOW_SHOT") ? NO : YES;
+    // Tour evidence also copies the drawable. Framebuffer-only drawables cannot be blitted.
+    layer.framebufferOnly = (getenv("LARECOMP_WINDOW_SHOT") || getenv("LARECOMP_TOUR_SHOTS")) ? NO : YES;
     // (iPadOS asks the window scene for landscape + a landscape minimum size in main(), before this window exists:
     // the restrictions only shape windows the system creates after they are set, runtime/platform/ios_ui.m)
 }

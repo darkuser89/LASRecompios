@@ -185,6 +185,9 @@ static bool same_info(const ShaderInfo *a, const ShaderInfo *b) {
     if (a->msl && strcmp(a->msl, b->msl)) return false;
     ShaderInfo x = *a, y = *b;
     x.msl = y.msl = NULL;
+    // The reference predates Metal's write-residency metadata; its generated source and all
+    // pre-existing metadata must still match. test_shader_memory.c checks the new flag separately.
+    x.writes_gmem = y.writes_gmem = false;
     return !memcmp(&x, &y, sizeof x);
 }
 

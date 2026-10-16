@@ -15,6 +15,25 @@
 // ================================================================== formats
 typedef struct { VkFormat vf; uint8_t expand_rgb, alpha_one; } VkFmt;
 
+// DEPTH24_STENCIL8 as itself where the GPU has it for everything the game does with depth (NVIDIA, Intel): half the
+// bytes of D32_SFLOAT_S8_UINT (4 instead of 8 per pixel) for every depth test, clear and copy - the game copies its
+// full-size depth twice a frame. AMD has no D24S8 attachments: D32S8 there (and on Metal). LARECOMP_VK_D24=0: D32S8.
+static VkFormat depth24_stencil8(void) {
+    static VkFormat f;
+    if (!f) {
+        const char *e = getenv("LARECOMP_VK_D24");
+        VkFormatProperties p;
+        vkGetPhysicalDeviceFormatProperties(g_vk.phys, VK_FORMAT_D24_UNORM_S8_UINT, &p);
+        VkFormatFeatureFlags want = VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+                                    VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
+                                    VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
+        bool ok = (p.optimalTilingFeatures & want) == want && !(e && !atoi(e));
+        f = ok ? VK_FORMAT_D24_UNORM_S8_UINT : VK_FORMAT_D32_SFLOAT_S8_UINT;
+        LOG("[vk] depth24 stencil8: %s\n", ok ? "D24_UNORM_S8_UINT" : "D32_SFLOAT_S8_UINT");
+    }
+    return f;
+}
+
 static VkFmt fmt_of(uint32_t f) {
     switch (f) {
     case 0x01: return (VkFmt){VK_FORMAT_R8_UNORM};
@@ -58,7 +77,7 @@ static VkFmt fmt_of(uint32_t f) {
     case 0x32: return (VkFmt){VK_FORMAT_D16_UNORM};
     case 0x33: return (VkFmt){VK_FORMAT_D32_SFLOAT};  // DEPTH24 (as on Metal: no 24-bit depth there)
     case 0x34: return (VkFmt){VK_FORMAT_D32_SFLOAT};
-    case 0x35: return (VkFmt){VK_FORMAT_D32_SFLOAT_S8_UINT};
+    case 0x35: return (VkFmt){depth24_stencil8()};
     case 0x36: return (VkFmt){VK_FORMAT_D32_SFLOAT_S8_UINT};
     case 0x37: return (VkFmt){VK_FORMAT_R8G8B8A8_SRGB, 0, 1};
     case 0x38: return (VkFmt){VK_FORMAT_R8G8B8A8_SRGB};
@@ -395,6 +414,8 @@ static TexBackend *tex_backend(NvnTexture *t) {
 void backend_texture_destroyed(NvnTexture *t) {
     TexBackend *b = t->backend;
     if (b) {
+        extern void vk_alias_texture_destroyed(NvnTexture *t);  // (exec.c copy aliases: a source's contents handed over)
+        vk_alias_texture_destroyed(t);
         live_remove(b);
         destroy_image(b);
         free(b->pending_rgba);
@@ -406,6 +427,8 @@ void backend_texture_destroyed(NvnTexture *t) {
 // Reboot (device.c backend_reset; GPU idle): every game texture and its views go.
 void vk_textures_reset(void) {
     int n = g_nlive;
+    extern void vk_alias_reset(void);
+    vk_alias_reset();
     while (g_nlive > 0) backend_texture_destroyed(g_live[g_nlive - 1]);
     vk_collect_dead();
     LOG("[vk] reboot: %d textures released\n", n);
@@ -459,7 +482,7 @@ static void upload_pending(TexBackend *b) {
                 vkCmdCopyBufferToImage(cb, s.buf, b->image, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
 }
 
-uint64_t prof_tex_checks, prof_tex_samples, prof_tex_full, prof_tex_full_bytes, prof_tex_dyn;
+uint64_t prof_tex_checks, prof_tex_samples, prof_tex_full, prof_tex_full_bytes, prof_tex_dyn, prof_tex_watch_skips;
 static void upload_texture(NvnTexture *t, TexBackend *b) {
     if (!t->addr || t->target == 10) return;
     uint64_t frame = vk_frame_counter();
@@ -477,9 +500,27 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
     static int always_full = -1;
     if (always_full < 0) always_full = getenv("LARECOMP_TEX_FULLHASH") ? 1 : 0;
     bool full = b->dynamic || !b->uploaded || always_full;
-    if (!full && frame - b->full_frame >= 120 && full_hash_budget >= total) { full = true; full_hash_budget -= total; }
+    bool periodic = frame - b->full_frame >= 120 && full_hash_budget >= total;  // (safety net: a full hash now and then)
+    if (!full && periodic) { full = true; full_hash_budget -= total; }
     if (!b->tp) b->tp = texpatch_identify(t) + 1;  // (button prompts / Hero Mode icon: re-uploaded when their look changes)
     bool restyle = b->tp > 0 && b->uploaded && b->tp_gen != texpatch_generation();
+    // The OS's page write tracking (exec.c vk_pages_changed, shared with the vertex cache): texture memory the CPU
+    // hasn't written since the last check is not hashed at all (dynamic textures were fully hashed every frame,
+    // ~2.4 MB a frame in the overworld). The periodic full hash stays as a safety net. LARECOMP_VK_TEX_WATCH=0: off.
+    static int watch = -1;
+    if (watch < 0) { const char *e = getenv("LARECOMP_VK_TEX_WATCH"); watch = !e || atoi(e) != 0; }
+    if (watch && !always_full) {
+        extern int vk_pages_changed(uint64_t addr, uint64_t size, uint32_t since, uint32_t *now);
+        uint32_t now = 0;
+        int ch = vk_pages_changed(t->addr, total, b->wgen, &now);
+        if (ch >= 0) {
+            b->wgen = now;
+            if (!ch && b->uploaded && !restyle) {
+                if (!periodic) { prof_tex_watch_skips++; return; }
+                if (b->dynamic) full_hash_budget -= total;  // (the others took theirs above)
+            }
+        }
+    }
     if (!full && !restyle) {
         prof_tex_samples++;
         uint64_t sh = fnv_sample(mem, total);

@@ -26,9 +26,7 @@ settings:
     GCC_C_LANGUAGE_STANDARD: gnu11
     CLANG_CXX_LANGUAGE_STANDARD: "c++17"
     ALWAYS_SEARCH_USER_PATHS: "NO"
-    # The guest window base (runtime/rt.h RT_BASE): the upstream base, which is also where iOS puts large
-    # allocations. Space above the default iOS VA limit (67.6 GB) needs the Extended Virtual Addressing entitlement
-    # in LASRecomp.entitlements; `make ios-app` passes the same value as Makefile IOS_BASE_MAIN.
+    # Use the original module base with a compact runtime window that fits the Air 4's normal address space.
     RT_BASE: "0x7000000000"
 
 targets:
@@ -80,6 +78,7 @@ targets:
         GCC_PREPROCESSOR_DEFINITIONS:
           - "$(inherited)"
           - "LARECOMP_STATIC_GAMELIB=1"               # the game code is linked in, not dlopen'd
+          - "LARECOMP_COMPACT_GUEST=1"                # 2.5625 GB window; no extended-addressing entitlement
           - "RT_BASE=$(RT_BASE)"                      # the guest window base (Makefile IOS_BASE_MAIN)
         OTHER_CFLAGS:
           - "-Wno-deprecated-declarations"

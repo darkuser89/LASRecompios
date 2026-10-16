@@ -600,6 +600,7 @@ def apply(cat, romfs, layouts, jump_rows, logic_defs, item_defs, settings, extra
 
     dungeon_of = settings.setdefault('dungeon-of', {})
     excluded = settings.setdefault('excluded-locations', set())
+    absent = settings.setdefault('absent-locations', set())  # (their rooms aren't in the layout: not in the game)
     rewritten = unused = fallback = 0
     targets = {k: (v.get('room'), v.get('level')) for k, v in lr.items()}
     for k, room in (extra_locations or {}).items():
@@ -623,7 +624,7 @@ def apply(cat, romfs, layouts, jump_rows, logic_defs, item_defs, settings, extra
             hl = next(l for l, (i, _) in LEVELS.items() if i == n)
             c2, gone = remap_cells(cond)
             if gone:  # (its room isn't in any layout: never reachable)
-                excluded.add(loc)
+                excluded.add(loc), absent.add(loc)
                 unused += 1
                 continue
             c2 = re.sub(rf'key-D{n}:\d+', f'key-D{n}:{lock_count.get(n, 0)}' if lock_count.get(n) else '', c2)
@@ -654,7 +655,7 @@ def apply(cat, romfs, layouts, jump_rows, logic_defs, item_defs, settings, extra
             fallback += 1  # a room at home the graph can't enter (no doorways: Bottle Grotto 03C, reached by a fall):
             continue       # its vanilla condition, on the redefined cell regions
         if not reach:
-            excluded.add(loc)
+            excluded.add(loc), absent.add(loc)
             unused += 1
             continue
         local, _ = strip(parse(cond), drop)
@@ -675,7 +676,7 @@ def apply(cat, romfs, layouts, jump_rows, logic_defs, item_defs, settings, extra
             continue
         c2, gone = remap_cells(cond)
         if gone:
-            excluded.add(loc)
+            excluded.add(loc), absent.add(loc)
             unused += 1
             continue
         v['condition-basic'] = c2
@@ -688,7 +689,7 @@ def apply(cat, romfs, layouts, jump_rows, logic_defs, item_defs, settings, extra
         need_k = {}  # 'Dn' -> [keys each check of the dungeon needs]
         for loc, d in dungeon_of.items():
             v = logic_defs.get(loc, {})
-            if loc in excluded or v.get('type') != 'item' or loc not in check_keys:
+            if loc in excluded or v.get('type') != 'item' or loc not in check_keys or vanilla_check(loc, v, settings):
                 continue
             need_k.setdefault(d, []).append(check_keys[loc])
         for level, (kc, n) in kcs.items():
@@ -746,10 +747,34 @@ def boss_door_ok(cat, romfs, level, layout, rows):
     return not (behind - allowed)
 
 
+INSTRUMENTS = ('full-moon-cello', 'conch-horn', 'sea-lilys-bell', 'surf-harp', 'wind-marimba', 'coral-triangle',
+               'evening-calm-organ', 'thunder-drum')
+
+
+def vanilla_check(loc, v, settings):
+    """A check LAS keeps vanilla (RandomizerCore/shuffler.py run()): no dungeon item can go there. (An unshuffled
+    instrument counted as room for one: DevGrid1's Tail Cave had 7 checks for 8 items - LAS crashed placing them.)"""
+    if v.get('content') in INSTRUMENTS and not settings.get('shuffle-instruments'):
+        return True
+    if loc.startswith('D0-rupee-') and not settings.get('blupsanity'):
+        return True
+    return v.get('subtype') not in ('chest', 'boss', 'enemy', 'drop', 'npc', 'standing', 'overworld-statue',
+                                    'dungeon-statue', 'underwater')
+
+
 def dungeon_items(settings):
     """How many items besides the small keys stay in their dungeon: Nightmare Key, Map, Compass, Stone Beak, less
     what the dungeon-items setting sends anywhere."""
     return 4 - {'mc': 2, 'mcb': 3, 'stone-beak': 1}.get(settings.get('dungeon-items', 'none'), 0)
+
+
+def lr_vanilla(k, v, settings):
+    """vanilla_check() for a location_rooms.json entry (it has no content): LAS keeps it vanilla / deletes it."""
+    if k.endswith('-instrument') and not settings.get('shuffle-instruments'):
+        return True
+    if v.get('subtype') == 'dungeon-statue' and not settings.get('owl-dungeon-gifts'):
+        return True  # (LAS deletes the owl statues' checks then)
+    return k.startswith('D0-rupee-') and not settings.get('blupsanity')
 
 
 def roomless_checks(settings):
@@ -760,6 +785,8 @@ def roomless_checks(settings):
     out = {}
     for k, v in lr.items():
         m = re.match(r'D(\d)-', k)
+        if lr_vanilla(k, v, settings):
+            continue
         if m and not v.get('room') and v.get('subtype') != 'boss' and k not in excluded:
             out[int(m.group(1))] = out.get(int(m.group(1)), 0) + 1
     return out
@@ -786,7 +813,7 @@ def fill_ok(cat, romfs, level, layout, rows, settings=None):
     lr = json.load(open(os.path.join(HERE, 'location_rooms.json')))
     per_room = {}
     for k, v in lr.items():
-        if v.get('room') and v.get('subtype') != 'boss':
+        if v.get('room') and v.get('subtype') != 'boss' and not lr_vanilla(k, v, settings or {}):
             per_room[v['room']] = per_room.get(v['room'], 0) + 1
     ks = []
     for room, count in per_room.items():

@@ -41,6 +41,8 @@ typedef struct {
     uint8_t rt_kind[8];     // fragment outputs: 0 float, 1 signed int, 2 unsigned int
     bool depth_minus_one;   // NVN depth mode [-1,1]: remap clip z
     bool flip_y;            // lower-left window origin
+    bool flip_x;            // mirror the image left to right (mirror mode's scene composite). (In the padding
+                            // after flip_y: keys without it hash as before - shader caches stay valid.)
     uint32_t vs_out_mask;   // fragment: varyings the vertex shader provides
     uint8_t glsl;           // emit Vulkan GLSL (see the contract above) instead of MSL
 } ShaderKey;
@@ -64,16 +66,29 @@ typedef struct {
     uint32_t out_mask;      // vertex: output varyings; fragment: render targets written
     bool writes_depth, uses_discard, writes_point_size;
     bool uses_gmem;         // global memory access: bind the guest heap at GMEM_BUFFER_INDEX
-    bool uses_tint;         // fragment: reads the per-draw tint (buffer 19, float4[2]) applied to color target 0
+    bool uses_gmem_map;     // (GLSL compute only) gmem loads look their address up in GMap (uniform, binding
+                            // GMAP_BUFFER_INDEX) and read GFast (storage, GFAST_BUFFER_INDEX) - a device-local copy of the
+                            // dispatch's storage buffers - when found, stores too (copied back after the dispatch).
+                            // runtime/nvn/vulkan/exec.c
+    bool uses_gmem_store;   // writes global memory (STG)
+    bool uses_tint;        // fragment: reads the per-draw tint (buffer 19, float4[2]) applied to color target 0
     bool uses_rscale;       // reads the resolution-scale table (fragment/compute buffer 18): float4 [0] = render
                             // target scale, [1 + i] = allocation scale of texture i
     uint32_t local_mem;     // bytes of local memory
     uint32_t num_insts;
     char error[256];        // set when translation fails
+    bool writes_gmem;       // STG present: residency must include writes, also for Metal
+    bool uses_sampler_table;  // MSL: more than 16 samplers are passed through an argument buffer
+    uint8_t sampler_table_index;  // an unused constant-buffer slot, below the vertex-stream slots
 } ShaderInfo;
 
 // Global memory (LDG/STG) is addressed through one buffer that wraps the guest heap.
 #define GMEM_BUFFER_INDEX 17
+// (GLSL compute, Vulkan) the fast copy of a dispatch's storage buffers: its address table and its data
+#define GMAP_BUFFER_INDEX 20
+#define GFAST_BUFFER_INDEX 21
+#define GMAP_MAX 16  // ranges in the table (GMap { uvec4 gmap[GMAP_MAX + 1]; }: [i] = addr lo, addr hi, size, word offset;
+                     // [GMAP_MAX].x = count)
 extern uint64_t maxwell_gmem_base, maxwell_gmem_size;
 // Debug: when translating the shader whose code starts at maxwell_dbg_code, output register
 // maxwell_dbg_reg as captured after the instruction at maxwell_dbg_pc (greyscale, all targets).

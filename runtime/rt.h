@@ -11,18 +11,35 @@
 #define FATAL(...) (fprintf(stderr, "FATAL: " __VA_ARGS__), rt_fatal_trace())
 
 // ---- address space layout (guest addresses == host addresses)
-// The window is one 12.5 GB reservation claimed at startup (constructor(101), main.c) whose base is RT_BASE:
+// The window is claimed at startup (constructor(101), main.c) at RT_BASE:
 //   - macOS/Windows/Linux: 0x70_0000_0000. macOS reserves everything below ~0x70_0000_0000 (0x2_0000_0000-0x70_...),
 //     and guest addresses must fit in 39 bits, so the mac build has always lived up here.
-//   - iPadOS: 0x4_0000_0000 (16 GB). iOS user VA ends at 0xFC0000000 (xnu osfmk/mach/arm/vm_param.h
-//     MACH_VM_MAX_ADDRESS_RAW, 67.6 GB; 140 TB only with the approval-gated Extended Virtual Addressing
-//     entitlement), so the macOS base cannot be mapped there at all. The iOS build compiles everything with
-//     -DRT_BASE=0x400000000 (Makefile IOS_BASE_MAIN) and generates its game code into generated-ios/ for the same
-//     base: it is baked into the recompiled code, so runtime and generated code must always agree.
+//   - iPadOS: LARECOMP_COMPACT_GUEST packs the runtime into a 2.5625 GB reservation at the same module base.
+//     This fits the Air 4's normal large-allocation range without Extended Virtual Addressing.
+// Runtime, generated code and the stack layout must always use the same base.
 #ifndef RT_BASE
 #define RT_BASE      0x7000000000ull
 #endif
 #define GUEST_LO     (RT_BASE)
+#ifdef LARECOMP_COMPACT_GUEST
+// A 4 GB iPad's normal high allocation range accepts up to 4 GB, but not the desktop's 12.5 GB window.
+// Keep the module addresses (and generated game code) identical, and pack the runtime-owned ranges below 3 GB.
+#define GUEST_HI     (RT_BASE + 0xA4000000ull)
+#define MAIN_BASE    (RT_BASE)
+#define SDK_BASE     (RT_BASE + 0x04000000ull)
+#define HLE_BASE     (RT_BASE + 0x08000000ull)
+#define HLE_SIZE     0x00100000ull
+#define TLS_BASE     (RT_BASE + 0x08100000ull)
+#define TLS_SIZE     0x00100000ull
+#define HLE_HEAP     (RT_BASE + 0x08200000ull)
+#define HLE_HEAP_SIZE 0x0E000000ull
+#define ALIAS_BASE   (RT_BASE + 0x18000000ull)
+#define ALIAS_SIZE   0x08000000ull
+#define GUEST_STACK_BASE (RT_BASE + 0x20000000ull)
+#define GUEST_STACK_SIZE 0x04000000ull
+#define HEAP_BASE    (RT_BASE + 0x24000000ull)
+#define HEAP_MAX     0x80000000ull
+#else
 #define GUEST_HI     (RT_BASE + 0x320000000ull)
 #define MAIN_BASE    (RT_BASE)
 #define SDK_BASE     (RT_BASE + 0x04000000ull)
@@ -36,6 +53,9 @@
 #define ALIAS_SIZE   0x0100000000ull
 #define HEAP_BASE    (RT_BASE + 0x240000000ull)
 #define HEAP_MAX     0x00D0000000ull   // 3.25 GB
+#define GUEST_STACK_BASE (RT_BASE + 0x200000000ull)
+#define GUEST_STACK_SIZE 0x0040000000ull
+#endif
 
 // ---- loader.c
 typedef struct Module {

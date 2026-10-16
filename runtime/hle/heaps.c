@@ -12,6 +12,13 @@
 #include <string.h>
 
 #include "../hle.h"
+#ifdef LARECOMP_COMPACT_GUEST
+#include <stdatomic.h>
+#include "resource_cache.h"
+#endif
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
 
 uint64_t loader_find_symbol(const char *name);
 void guest_call(Cpu *c, uint64_t addr);
@@ -44,9 +51,29 @@ static void fail_once(const char *what, uint64_t lr, uint64_t size) {
 typedef struct { uint64_t head; void *mem; } UnitBuf;
 static UnitBuf g_unit[256];
 static pthread_mutex_t g_unit_lock = PTHREAD_MUTEX_INITIALIZER;
+#ifdef LARECOMP_COMPACT_GUEST
+static void *g_resource_cache;
+static uint64_t g_resource_allocator;
+static size_t g_resource_size;
+static _Atomic uint64_t g_resource_flush_time;
+
+static void resource_cache_flush(uint64_t allocator) {
+    if (allocator != g_resource_allocator || !g_resource_cache) return;
+    uint64_t now = plat_now_ns(), last = atomic_load(&g_resource_flush_time);
+    if (now - last >= 2000000000ull && atomic_compare_exchange_strong(&g_resource_flush_time, &last, now))
+        msync(g_resource_cache, g_resource_size, MS_ASYNC);
+}
+#endif
 
 // Reboot: our unit-heap buffers (host memory, not in the guest window) go with the game that made them.
 RT_ON_RESET(heaps_reset) {
+#ifdef LARECOMP_COMPACT_GUEST
+    if (g_resource_cache) munmap(g_resource_cache, g_resource_size);
+    g_resource_cache = NULL;
+    g_resource_allocator = 0;
+    g_resource_size = 0;
+    atomic_store(&g_resource_flush_time, 0);
+#endif
     for (int i = 0; i < 256; i++)
         if (g_unit[i].mem) {
 #ifdef _WIN32
@@ -60,7 +87,17 @@ RT_ON_RESET(heaps_reset) {
 
 static int unit_scale(void) {
     static int s = -1;
-    if (s < 0) { const char *e = ENV("LARECOMP_UNIT_HEAP_SCALE"); s = e ? atoi(e) : 4; if (s < 1) s = 1; }
+    if (s < 0) {
+        const char *e = ENV("LARECOMP_UNIT_HEAP_SCALE");
+        // Keep the game's original pools on mobile. The desktop's fourfold expansion eagerly zeros
+        // extra backing memory even in vanilla play; large randomizer layouts can opt in explicitly.
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+        s = e ? atoi(e) : 1;
+#else
+        s = e ? atoi(e) : 4;
+#endif
+        if (s < 1) s = 1;
+    }
     return s;
 }
 
@@ -137,6 +174,33 @@ HLE_FUNC("_ZN2nn4lmem21AllocateFromFrameHeapEPNS0_6detail8HeapHeadEmi", heap_all
 
 // nn::mem::StandardAllocator::Initialize(void *addr, size_t size[, bool])
 HLE_FUNC("_ZN2nn3mem17StandardAllocator10InitializeEPvm", heap_std_init) {
+#ifdef LARECOMP_COMPACT_GUEST
+    // v1.0.0 allocates its resource-cache buffer from the remaining application heap (+0x38 in the
+    // cache owner), but initializes the allocator with a fixed 1334 MB even when that buffer is smaller.
+    // The compact heap leaves only ~230 MB for that buffer, which cannot hold the title's resources.
+    // The overworld loads a ~258 MB archive plus many other resources alongside the common cache.
+    // Both 512 and 768 MB exhaust this allocator during that transition. Preserve the game's capacity
+    // with temporary shared file backing: inactive archive pages can be reclaimed under memory
+    // pressure instead of counting the entire working cache against the iPad's anonymous-memory limit.
+    // GPU buffer mappings may also reference this cache. The caller restores x19 before this tail
+    // call. Release the mapping only after guest threads and GPU commands stop on reboot.
+    if (c->x[30] == MAIN_BASE + 0xa548 && c->x[2] == 0x53600000 &&
+        c->x[19] >= HEAP_BASE && c->x[19] < HEAP_BASE + HEAP_MAX - 0x40) {
+        uint64_t actual = LD64(c->x[19] + 0x38);
+        if (!actual || actual > c->x[2]) FATAL("invalid compact resource-cache buffer size %llx\n", actual);
+        const uint64_t size = c->x[2];
+        if (!g_resource_cache) {
+            g_resource_cache = resource_cache_map(size);
+            if (!g_resource_cache) FATAL("cannot map compact resource cache: %s\n", strerror(errno));
+            g_resource_size = size;
+        }
+        g_resource_allocator = c->x[0];
+        LOG("[heaps] resource cache: %llu MB temporary file backing (guest remainder %llu MB)\n",
+            (unsigned long long)(size >> 20), (unsigned long long)(actual >> 20));
+        c->x[1] = (uint64_t)(uintptr_t)g_resource_cache;
+        c->x[2] = size;
+    }
+#endif
     uint64_t lr = c->x[30], size = c->x[2];
     CALL("_ZN2nn3mem17StandardAllocator10InitializeEPvm");
     if (ENV("LARECOMP_LOG_HEAPS"))
@@ -152,12 +216,29 @@ HLE_FUNC("_ZN2nn3mem17StandardAllocator10InitializeEPvmb", heap_std_init_b) {
 
 HLE_FUNC("_ZN2nn3mem17StandardAllocator8AllocateEm", heap_std_alloc) {
     uint64_t lr = c->x[30], size = c->x[1];
+#ifdef LARECOMP_COMPACT_GUEST
+    uint64_t allocator = c->x[0];
+#endif
     CALL("_ZN2nn3mem17StandardAllocator8AllocateEm");
+#ifdef LARECOMP_COMPACT_GUEST
+    resource_cache_flush(allocator);
+#endif
     if (!c->x[0] && size) fail_once("standard allocation", lr, size);
 }
 
 HLE_FUNC("_ZN2nn3mem17StandardAllocator8AllocateEmm", heap_std_alloc_a) {
     uint64_t lr = c->x[30], size = c->x[1];
+#ifdef LARECOMP_COMPACT_GUEST
+    uint64_t allocator = c->x[0];
+#endif
     CALL("_ZN2nn3mem17StandardAllocator8AllocateEmm");
+#ifdef LARECOMP_COMPACT_GUEST
+    resource_cache_flush(allocator);
+    if ((size >= (64ull << 20) || (!c->x[0] && size)) && ENV("LARECOMP_LOG_HEAPS"))
+        LOG("[heaps] large allocation %llu MB, allocator %llx (%s) -> %llx, lr %llx\n",
+            (unsigned long long)(size >> 20), (unsigned long long)allocator,
+            allocator == g_resource_allocator ? "resource cache" : "other",
+            (unsigned long long)c->x[0], (unsigned long long)lr);
+#endif
     if (!c->x[0] && size) fail_once("standard allocation (aligned)", lr, size);
 }

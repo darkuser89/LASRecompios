@@ -4,6 +4,9 @@
 
 #include "../kernel.h"
 #include "nvn.h"
+#ifdef LARECOMP_COMPACT_GUEST
+#include "gpu_memory.h"
+#endif
 
 void renderer_sync(void);
 
@@ -46,7 +49,9 @@ NVN(nvnDeviceGetInteger) { *(int32_t *)AP(2) = (int32_t)device_integer((uint32_t
 NVN(nvnDeviceGetCurrentTimestampInNanoseconds) {
     RET(plat_now_ns());
 }
-NVN(nvnDeviceGetTimestampInNanoseconds) { RET(G(uint64_t, A(1), 8)); }  // counter.timestamp (ticks == ns here)
+NVN(nvnDeviceGetTimestampInNanoseconds) {  // counter.timestamp: Switch GPU ticks (614.4 MHz, as the counters are written)
+    RET((uint64_t)((unsigned __int128)G(uint64_t, A(1), 8) * 625 / 384));
+}
 NVN(nvnDeviceSetIntermediateShaderCache) { (void)c; }
 NVN(nvnDeviceGetTextureHandle) { RET((A(1) & 0xFFFFF) | ((A(2) & 0xFFF) << 20)); }
 NVN(nvnDeviceGetTexelFetchHandle) { RET(A(1) & 0xFFFFF); }
@@ -188,7 +193,10 @@ NVN(nvnMemoryPoolInitialize) {
     SET_HOST(A(0), p);
     RET(1);
 }
-NVN(nvnMemoryPoolFinalize) { free(HOST(NvnPool, A(0))); SET_HOST(A(0), 0); }
+NVN(nvnMemoryPoolFinalize) {
+    NvnPool *p = HOST(NvnPool, A(0));
+    free(p); SET_HOST(A(0), 0);
+}
 NVN(nvnMemoryPoolSetDebugLabel) { (void)c; }
 NVN(nvnMemoryPoolMap) { RET(HOST(NvnPool, A(0))->storage); }
 NVN(nvnMemoryPoolGetBufferAddress) { RET(HOST(NvnPool, A(0))->storage); }  // GPU address == CPU address
@@ -219,9 +227,20 @@ NVN(nvnBufferInitialize) {
     G(uint64_t, A(0), 0x10) = off;
     G(uint64_t, A(0), 0x18) = G(uint64_t, A(1), 0x18);
     G(uint64_t, A(0), 0x20) = next_debug_id++;
+#ifdef LARECOMP_COMPACT_GUEST
+    // A pool can contain a whole resource archive, including CPU-decoded textures. Pin only buffers:
+    // shader global pointers address these ranges; texture uploads read their backing on the CPU.
+    gpu_pool_add(G(uint64_t, A(0), 0), G(uint64_t, A(0), 0x18));
+#endif
     RET(1);
 }
-NVN(nvnBufferFinalize) { (void)c; }
+NVN(nvnBufferFinalize) {
+#ifdef LARECOMP_COMPACT_GUEST
+    gpu_pool_remove(G(uint64_t, A(0), 0), G(uint64_t, A(0), 0x18));
+#else
+    (void)c;
+#endif
+}
 NVN(nvnBufferSetDebugLabel) { (void)c; }
 NVN(nvnBufferMap) { RET(G(uint64_t, A(0), 0)); }
 NVN(nvnBufferGetAddress) { RET(G(uint64_t, A(0), 0)); }

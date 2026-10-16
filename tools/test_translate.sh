@@ -11,15 +11,17 @@ COUNT=${1:-20000}
 JOBS=${2:-8}
 MODE=${3:-both}
 REF=${REF:-652e234}
-OUT=build/test_translate
+OUT=${OUT:-build/test_translate}
 mkdir -p "$OUT/old" "$OUT/dump"
 git show "$REF:runtime/nvn/maxwell/translate.c" > "$OUT/old/translate.c"
-git show "$REF:runtime/nvn/maxwell/shader.h" > "$OUT/old/shader.h"
+# Compile both implementations with the same layout: added metadata must not make the comparator
+# read past a reference allocation made with an older ShaderInfo definition.
+cp runtime/nvn/maxwell/shader.h "$OUT/old/shader.h"
 CC=${CC:-clang}
 RENAME="-Dmaxwell_translate=old_maxwell_translate -Dmaxwell_free=old_maxwell_free
  -Dmaxwell_disassemble=old_maxwell_disassemble -Dmaxwell_gmem_base=old_maxwell_gmem_base
  -Dmaxwell_gmem_size=old_maxwell_gmem_size -Dmaxwell_dbg_code=old_maxwell_dbg_code -Dmaxwell_dbg_pc=old_maxwell_dbg_pc
- -Dmaxwell_dbg_reg=old_maxwell_dbg_reg -Dmaxwell_dbg_vs=old_maxwell_dbg_vs"
+ -Dmaxwell_dbg_reg=old_maxwell_dbg_reg -Dmaxwell_dbg_vs=old_maxwell_dbg_vs -Dmaxwell_dbg_hash=old_maxwell_dbg_hash"
 PRE=""
 case "$(uname -s)" in MINGW*|MSYS*) PRE="-include malloc.h";; esac
 $CC -O2 -w $PRE $RENAME -c "$OUT/old/translate.c" -o "$OUT/old.o"

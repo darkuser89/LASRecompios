@@ -37,13 +37,29 @@ static LONG CALLBACK vectored_handler(EXCEPTION_POINTERS *ep) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+// The window keeps write tracking (MEM_WRITE_WATCH: the Vulkan renderer's vertex / index cache re-copies only pages the
+// CPU wrote, runtime/nvn/vulkan/exec.c). Without it (refused): no tracking, the renderer reads guest memory in place.
+static bool g_write_watch;
+
 bool plat_reserve_guest(uint64_t lo, uint64_t hi) {
-    void *p = VirtualAlloc((void *)(uintptr_t)lo, hi - lo, MEM_RESERVE, PAGE_READWRITE);
+    void *p = VirtualAlloc((void *)(uintptr_t)lo, hi - lo, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_READWRITE);
+    if (p == (void *)(uintptr_t)lo) g_write_watch = true;
+    else p = VirtualAlloc((void *)(uintptr_t)lo, hi - lo, MEM_RESERVE, PAGE_READWRITE);
     if (p != (void *)(uintptr_t)lo) return false;
     g_lo = lo;
     g_hi = hi;
     AddVectoredExceptionHandler(1, vectored_handler);
     return true;
+}
+
+int plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, int max, uint64_t *page) {
+    if (!g_write_watch || addr < g_lo || addr + size > g_hi || max <= 0) return -1;
+    ULONG_PTR n = (ULONG_PTR)max;
+    DWORD gran = 4096;
+    if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, (void *)(uintptr_t)addr, (SIZE_T)size, (PVOID *)pages, &n, &gran) != 0) return -1;
+    *page = gran;
+    if (n >= (ULONG_PTR)max) ResetWriteWatch((void *)(uintptr_t)addr, (SIZE_T)size);  // (more than fit: caller takes all)
+    return (int)n;
 }
 
 // Decommit everything: the range stays reserved, and pages come back zeroed when committed again (lazily).
