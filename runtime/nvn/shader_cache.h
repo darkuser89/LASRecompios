@@ -33,13 +33,16 @@ typedef struct {
 } MetalShaderCache;
 
 static inline void metal_shader_cache_reset(MetalShaderCache *c) {
-    c->parts = nil;
+    @synchronized([MetalShaderPart class]) { c->parts = nil; }
     // Exact source/options are independent of guest addresses. Keep the bounded function cache
     // through a reboot, including entries whose compilation is still in flight.
 }
 
-static inline MetalShaderPart *metal_shader_part(MetalShaderCache *c, uint64_t address, uint64_t code_hash,
-                                                size_t length, int stage, const ShaderKey *key) {
+static inline MetalShaderPart *metal_shader_part_source(MetalShaderCache *c, uint64_t address, uint64_t code_hash,
+                                                size_t length, int stage, const ShaderKey *key, const uint8_t *source) {
+    // The translator still has shared scratch buffers. Keep translation/coalescing serialized,
+    // while the much slower Metal function and pipeline compiles can run on both workers.
+    @synchronized([MetalShaderPart class]) {
     struct {
         uint64_t address, code_hash, length, debug_code, debug_vs, debug_hash;
         uint32_t debug_pc, debug_reg, stage;
@@ -62,11 +65,17 @@ static inline MetalShaderPart *metal_shader_part(MetalShaderCache *c, uint64_t a
     NSData *k = [NSData dataWithBytes:&identity length:sizeof identity];
     if (!c->parts) c->parts = [NSMutableDictionary new];
     MetalShaderPart *part = c->parts[k];
-    if (part) { c->translation_hits++; return part; }
+    if (part) { __atomic_fetch_add(&c->translation_hits, 1, __ATOMIC_RELAXED); return part; }
     part = [MetalShaderPart new];
-    part->info = maxwell_translate((const uint8_t *)(uintptr_t)address, length, stage, &identity.key);
-    c->parts[k] = part; c->translations++;
+    part->info = maxwell_translate_snapshot(source, length, stage, &identity.key, address);
+    c->parts[k] = part; __atomic_fetch_add(&c->translations, 1, __ATOMIC_RELAXED);
     return part;
+    }
+}
+
+static inline MetalShaderPart *metal_shader_part(MetalShaderCache *c, uint64_t address, uint64_t code_hash,
+                                                size_t length, int stage, const ShaderKey *key) {
+    return metal_shader_part_source(c, address, code_hash, length, stage, key, (const uint8_t *)(uintptr_t)address);
 }
 
 static inline id<MTLFunction> metal_shader_function(MetalShaderCache *c, id<MTLDevice> dev, const char *msl,

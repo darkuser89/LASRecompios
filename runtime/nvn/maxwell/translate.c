@@ -2031,6 +2031,11 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
 }
 
 ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, const ShaderKey *key) {
+    return maxwell_translate_snapshot(blob, max_size, stage, key, (uintptr_t)blob);
+}
+
+ShaderInfo *maxwell_translate_snapshot(const uint8_t *blob, size_t max_size, int stage, const ShaderKey *key,
+                                       uint64_t guest_address) {
     ShaderInfo *info = calloc(1, sizeof *info);
     info->stage = stage;
     Ctx *c = calloc(1, sizeof *c);
@@ -2086,7 +2091,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     }
     // translate
     bool dbg = stage == STAGE_FRAGMENT &&
-               ((maxwell_dbg_code && blob == maxwell_dbg_code) ||
+               ((maxwell_dbg_code && guest_address == (uintptr_t)maxwell_dbg_code) ||
                 (maxwell_dbg_hash && maxwell_code_fp(blob) == maxwell_dbg_hash));
     static int annotate = -1;
     if (annotate < 0) annotate = getenv("LARECOMP_SAVE_MSL") != NULL;
@@ -2217,7 +2222,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         sp(&args, ", constant SamplerTable &sampler_table [[buffer(%d)]]", info->sampler_table_index);
     if (stage == STAGE_VERTEX) {
         sp(&s, "vertex VOut main0(VIn in [[stage_in]], uint vid [[vertex_id]], uint iid [[instance_id]]%s%s) {\n",
-           (maxwell_dbg_vs && blob == maxwell_dbg_vs) ? ", device float4 *dbgout [[buffer(29)]]" : "",
+           (maxwell_dbg_vs && guest_address == (uintptr_t)maxwell_dbg_vs) ? ", device float4 *dbgout [[buffer(29)]]" : "",
            args.buf ? args.buf : "");
         sp(&s, "  VOut out = {};\n  out.pos = float4(0, 0, 0, 1);\n");
         for (int i = 0; i < 32; i++)
@@ -2255,7 +2260,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         if (key && key->flip_y) sp(&s, "  out.pos.y = -out.pos.y;\n");
         if (key && key->flip_x) sp(&s, "  out.pos.x = -out.pos.x;\n");
         if (key && key->depth_minus_one) sp(&s, "  out.pos.z = (out.pos.z + out.pos.w) * 0.5f;\n");
-        if (maxwell_dbg_vs && blob == maxwell_dbg_vs) sp(&s, "  if (iid < 64u && vid < 8u) { dbgout[iid * 8u + vid] = out.pos; dbgout[512u + iid * 8u + vid] = %s; }\n", (c->out_attr_mask & 2u) ? "out.v1" : "float4(0)");
+        if (maxwell_dbg_vs && guest_address == (uintptr_t)maxwell_dbg_vs) sp(&s, "  if (iid < 64u && vid < 8u) { dbgout[iid * 8u + vid] = out.pos; dbgout[512u + iid * 8u + vid] = %s; }\n", (c->out_attr_mask & 2u) ? "out.v1" : "float4(0)");
         sp(&s, "  return out;\n}\n");
     } else if (stage == STAGE_FRAGMENT) {
         sp(&s, "  FOut o;\n");

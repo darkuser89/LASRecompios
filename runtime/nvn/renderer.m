@@ -22,6 +22,7 @@
 #include "render_state.h"
 #include "shader_buffers.h"
 #include "shader_cache.h"
+#include "shader_jobs.h"
 #ifdef LARECOMP_COMPACT_GUEST
 #include "gpu_memory.h"
 #endif
@@ -99,14 +100,21 @@ extern uint32_t g_window_origin_lower_left_hack;
 uint32_t nvn_window_origin(void);
 bool renderer_origin_lower_left(void) { return nvn_window_origin() == 0; }
 
-static double stat_compile_ms;  // time spent building shaders/pipelines (first-use stutter)
-static int stat_compiles;
-static _Atomic unsigned pending_shader_jobs;
-unsigned renderer_pending_shaders(void) { return atomic_load(&pending_shader_jobs); }
+static _Atomic uint64_t stat_compile_ns;
+static _Atomic unsigned stat_compiles;
+static MetalShaderJobs *shader_jobs;
+static void shader_debug_init(void);
+unsigned renderer_pending_shaders(void) { return shader_jobs ? atomic_load(&shader_jobs->pending) : 0; }
 static inline double now_ms(void) { return (double)clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e6; }
-#define TIMED_COMPILE(expr) ({ double t0_ = now_ms(); __auto_type r_ = (expr); stat_compile_ms += now_ms() - t0_; stat_compiles++; r_; })
+static void record_compile(double ms) {
+    atomic_fetch_add(&stat_compile_ns, (uint64_t)(ms * 1e6));
+    atomic_fetch_add(&stat_compiles, 1);
+}
+#define TIMED_COMPILE(expr) ({ double t0_ = now_ms(); __auto_type r_ = (expr); record_compile(now_ms() - t0_); r_; })
 
 const char *renderer_stats(void) {
+    unsigned compiles = atomic_exchange(&stat_compiles, 0);
+    double compile_ms = atomic_exchange(&stat_compile_ns, 0) / 1e6;
     uint64_t wait_ns[3], wait_n[3], wait_total = 0;
     for (unsigned i = 0; i < 3; i++) {
         wait_ns[i] = atomic_exchange_explicit(&stat_wait_by[i], 0, memory_order_relaxed);
@@ -129,7 +137,8 @@ const char *renderer_stats(void) {
         LOG("[reuse] prepare %llu hits/%llu misses, constant copies %llu/%llu, shader translations %llu/%llu hits, compiles %llu/%llu hits\n",
             (unsigned long long)prepare_hits, (unsigned long long)prepare_misses,
             (unsigned long long)shader_buffers.copies, (unsigned long long)shader_buffers.requests,
-            (unsigned long long)shader_cache.translations, (unsigned long long)shader_cache.translation_hits,
+            (unsigned long long)__atomic_load_n(&shader_cache.translations, __ATOMIC_RELAXED),
+            (unsigned long long)__atomic_load_n(&shader_cache.translation_hits, __ATOMIC_RELAXED),
             (unsigned long long)__atomic_load_n(&shader_cache.compilations, __ATOMIC_RELAXED),
             (unsigned long long)__atomic_load_n(&shader_cache.compilation_hits, __ATOMIC_RELAXED));
     if (getenv("LARECOMP_RENDER_STATS"))
@@ -166,11 +175,13 @@ const char *renderer_stats(void) {
             (int)NSProcessInfo.processInfo.lowPowerModeEnabled);
 #endif
     snprintf(stats_text, sizeof stats_text, "%llu draws, %llu skipped, %llu passes, %llu dispatches, %llu flushes, gpu %.0fms, wait %.0fms, compile %d/%.0fms, fbcopy %llu | tex %d (%.0f MB) views %d snaps %lu mem %.0f MB | waits fence %.0fms/%llu flush %.0fms/%llu all %.0fms/%llu", stat_draws, stat_skipped,
-             stat_passes, stat_dispatches, stat_flushes, gpu_ms, wait_total / 1e6, stat_compiles, stat_compile_ms, stat_feedback_copies,
+             stat_passes, stat_dispatches, stat_flushes, gpu_ms, wait_total / 1e6, compiles, compile_ms, stat_feedback_copies,
              g_tex_live, g_tex_live_bytes / 1048576.0, g_views_live, (unsigned long)(g_snap_copies ? g_snap_copies.count : 0), foot / 1048576.0, wait_ns[0] / 1e6, (unsigned long long)wait_n[0], wait_ns[1] / 1e6, (unsigned long long)wait_n[1], wait_ns[2] / 1e6, (unsigned long long)wait_n[2]);
-    stat_compiles = 0;
+    if (getenv("LARECOMP_RENDER_STATS") && shader_jobs)
+        LOG("[shader-jobs] workers %u, pending %u/%u, running %u, peak %u, deferred %u\n",
+            shader_jobs->workers, atomic_load(&shader_jobs->pending), shader_jobs->capacity,
+            atomic_load(&shader_jobs->running), atomic_load(&shader_jobs->peak), atomic_load(&shader_jobs->deferred));
     stat_feedback_copies = 0;
-    stat_compile_ms = 0;
     stat_draws = stat_skipped = stat_passes = stat_dispatches = stat_flushes = 0;
     return stats_text;
 }
@@ -193,6 +204,10 @@ static void st_defaults(void) {
 void renderer_init(id<MTLDevice> d) {
     dev = d;
     cache = [NSMutableDictionary new];
+    shader_debug_init();
+    unsigned workers = metal_shader_workers(NSProcessInfo.processInfo.physicalMemory, (unsigned)NSProcessInfo.processInfo.activeProcessorCount);
+    shader_jobs = [[MetalShaderJobs alloc] initWithWorkers:workers];
+    LOG("[shader-jobs] background workers %u, queue capacity %u\n", workers, shader_jobs->capacity);
     render_state.legacy = getenv("LARECOMP_RENDER_STATE_LEGACY") != NULL;
     buffer_bindings.legacy = getenv("LARECOMP_BUFFER_BINDINGS_LEGACY") != NULL;
     st_defaults();
@@ -759,7 +774,7 @@ static int cbuf_base = 3, tex_base = 8;
     id<MTLFunction> vs, fs;
     ShaderInfo *vi, *fi;
     MetalShaderPart *vpart, *fpart;
-    bool failed;
+    _Atomic bool failed;
     _Atomic bool ready;  // functions compiled (async compile: draws are skipped until then)
 }
 @end
@@ -1020,6 +1035,41 @@ static bool sync_shaders(void) {  // LARECOMP_SYNC_SHADERS: compile on first use
     return v;
 }
 
+static void shader_debug_init(void) {
+    maxwell_gmem_base = HEAP_BASE;
+    maxwell_gmem_size = HEAP_MAX;
+    {
+        // LARECOMP_DBG_FS=<fs code addr hex>:<pc hex>:<reg>
+        static int parsed;
+        static unsigned long long dbg_addr;
+        static unsigned dbg_pc;
+        static int dbg_reg;
+        if (!parsed) { parsed = 1; const char *e = getenv("LARECOMP_DBG_FS"); if (e) sscanf(e, "%llx:%x:%d", &dbg_addr, &dbg_pc, &dbg_reg); }
+        maxwell_dbg_code = dbg_addr ? (const uint8_t *)(uintptr_t)dbg_addr : NULL;
+        static unsigned long long dbg_vs;
+        static int vparsed;
+        if (!vparsed) { vparsed = 1; const char *e = getenv("LARECOMP_DBG_VS"); if (e) dbg_vs = strtoull(e, NULL, 16); }
+        maxwell_dbg_vs = dbg_vs ? (const uint8_t *)(uintptr_t)dbg_vs : NULL;
+        // Resolve process-wide debug settings before workers start. Translation reads these immutable values;
+        // snapshot translation keeps the original guest address for the address-based probes.
+        static int hparsed, dbg_hash_on;
+        static unsigned long long dbg_hash;
+        static unsigned dbg_hpc;
+        static int dbg_hreg;
+        if (!hparsed) {
+            hparsed = 1;
+            const char *e = getenv("LARECOMP_DBG_FS_HASH");
+            if (e && sscanf(e, "%llx:%x:%d", &dbg_hash, &dbg_hpc, &dbg_hreg) == 3) {
+                dbg_hash_on = 1;
+                LOG("[dbg] probing shader %016llx pc %x reg %d\n", dbg_hash, dbg_hpc, dbg_hreg);
+            }
+        }
+        maxwell_dbg_hash = dbg_hash_on ? dbg_hash : 0;
+        if (dbg_hash_on) { maxwell_dbg_pc = dbg_hpc; maxwell_dbg_reg = dbg_hreg; }
+        else { maxwell_dbg_pc = dbg_pc; maxwell_dbg_reg = dbg_reg; }
+    }
+}
+
 static void compile_program(Prog *pr) {
     double t0 = now_ms();
     NSString *error = nil;
@@ -1027,10 +1077,61 @@ static void compile_program(Prog *pr) {
     if (!pr->vs) { LOG("[shader] VS compile failed: %s\n", error.UTF8String); pr->failed = true; return; }
     pr->fs = metal_shader_function(&shader_cache, dev, pr->fi->msl, false, &error);
     if (!pr->fs) { LOG("[shader] FS compile failed: %s\n", error.UTF8String); pr->failed = true; return; }
-    __atomic_fetch_add(&stat_compiles, 1, __ATOMIC_RELAXED);
-    double dt = now_ms() - t0;
-    @synchronized(cache) { stat_compile_ms += dt; }
+    record_compile(now_ms() - t0);
     pr->ready = true;
+}
+
+@interface ShaderRequest : NSObject {
+@public
+    NSData *vcode, *fcode;
+    uint64_t address[2], hash[2], fingerprint[2];
+    size_t length[2];
+    ShaderKey vkey, fkey;
+}
+@end
+@implementation ShaderRequest
+@end
+
+static size_t shader_code_length(const NvnShaderStage *stage, bool compute) {
+    // maxwell_translate scans at most 65536 instructions. Bound owned snapshots to the same range.
+    size_t n = stage->const_offset ? stage->const_offset : 0x10000;
+    return MIN(n, 0x80000u + (compute ? 0u : 0x80u));
+}
+
+static void prepare_program(Prog *pr, ShaderRequest *request) {
+    pr->vpart = metal_shader_part_source(&shader_cache, request->address[0], request->hash[0], request->length[0], STAGE_VERTEX, &request->vkey, request->vcode.bytes);
+    pr->vi = pr->vpart->info;
+    if (!pr->vi->msl) {
+        LOG("[shader] VS translate failed: %s (code %llx)\n", pr->vi->error, request->address[0]);
+        char path[128];
+        snprintf(path, sizeof path, "build/shaders/fail_%llx_s0_code.bin", request->address[0]);
+        FILE *f = fopen(path, "wb");
+        if (f) { fwrite(request->vcode.bytes, 1, request->vcode.length, f); fclose(f); }
+        pr->failed = true;
+        return;
+    }
+    request->fkey.vs_out_mask = pr->vi->out_mask;
+    pr->fpart = metal_shader_part_source(&shader_cache, request->address[1], request->hash[1], request->length[1], STAGE_FRAGMENT, &request->fkey, request->fcode.bytes);
+    pr->fi = pr->fpart->info;
+    if (!pr->fi->msl) { LOG("[shader] FS translate failed: %s\n", pr->fi->error); pr->failed = true; return; }
+    if (getenv("LARECOMP_SAVE_MSL")) {
+        mkdir("build/msl", 0755);
+        char path[256];
+        snprintf(path, sizeof path, "build/msl/%llx_vs.metal", request->address[0]);
+        FILE *f = fopen(path, "w"); if (f) { fputs(pr->vi->msl, f); fclose(f); }
+        snprintf(path, sizeof path, "build/msl/%llx_fs.metal", request->address[1]);
+        f = fopen(path, "w"); if (f) { fputs(pr->fi->msl, f); fclose(f); }
+        // also keyed by the content fingerprint the [fshash] log prints: the code addresses above are heap addresses
+        // and differ between runs, so shaders can only be paired across runs/platforms by this hash
+        uint64_t vh = request->fingerprint[0];
+        uint64_t fh = request->fingerprint[1];
+        snprintf(path, sizeof path, "build/msl/%016llx_vs.metal", (unsigned long long)vh);
+        f = fopen(path, "w"); if (f) { fputs(pr->vi->msl, f); fclose(f); }
+        snprintf(path, sizeof path, "build/msl/%016llx_fs.metal", (unsigned long long)fh);
+        f = fopen(path, "w"); if (f) { fputs(pr->fi->msl, f); fclose(f); }
+    }
+    @synchronized([ShaderRequest class]) { shader_cache_note(pr->vi->msl, pr->fi->msl); }
+    compile_program(pr);
 }
 
 static Prog *get_program(NvnProgram *p, ShaderKey *vkey, ShaderKey *fkey) {
@@ -1058,96 +1159,28 @@ static Prog *get_program(NvnProgram *p, ShaderKey *vkey, ShaderKey *fkey) {
         prog_tab[slot].prog = (__bridge void *)pr;
         return pr->failed ? nil : pr;
     }
+    if (!sync_shaders() && atomic_load(&shader_jobs->pending) >= shader_jobs->capacity) return nil;
     pr = [Prog new];
+    ShaderRequest *request = [ShaderRequest new];
+    request->vkey = *vkey; request->fkey = *fkey;
+    for (int i = 0; i < 2; i++) {
+        request->address[i] = p->stages[i].code_addr;
+        request->hash[i] = p->stages[i].code_hash;
+        request->fingerprint[i] = p->stages[i].fingerprint;
+        request->length[i] = shader_code_length(&p->stages[i], false);
+        if (!request->address[i] || request->length[i] < 0x80) return nil;
+    }
+    // Nothing on a worker points into the mutable guest heap or NVN state. Include fingerprint bytes
+    // for debug probes even when the instruction stream is shorter than the 512-byte fingerprint.
+    request->vcode = [NSData dataWithBytes:(void *)(uintptr_t)request->address[0] length:MAX(request->length[0], 0x230u)];
+    request->fcode = [NSData dataWithBytes:(void *)(uintptr_t)request->address[1] length:MAX(request->length[1], 0x230u)];
+    dump_program(p);  // explicit diagnostic mode only
+    if (sync_shaders()) prepare_program(pr, request);
+    else if (![shader_jobs enqueue:^{ prepare_program(pr, request); } required:NO]) return nil;
     cache[key] = pr;
     prog_tab[slot].key = h;
-    prog_tab[slot].prog = (__bridge void *)pr;  // retained by the cache dictionary
-    dump_program(p);
-    maxwell_gmem_base = HEAP_BASE;
-    maxwell_gmem_size = HEAP_MAX;
-    {
-        // LARECOMP_DBG_FS=<fs code addr hex>:<pc hex>:<reg>
-        static int parsed;
-        static unsigned long long dbg_addr;
-        static unsigned dbg_pc;
-        static int dbg_reg;
-        if (!parsed) { parsed = 1; const char *e = getenv("LARECOMP_DBG_FS"); if (e) sscanf(e, "%llx:%x:%d", &dbg_addr, &dbg_pc, &dbg_reg); }
-        maxwell_dbg_code = dbg_addr ? (const uint8_t *)(uintptr_t)dbg_addr : NULL;
-        static unsigned long long dbg_vs;
-        static int vparsed;
-        if (!vparsed) { vparsed = 1; const char *e = getenv("LARECOMP_DBG_VS"); if (e) dbg_vs = strtoull(e, NULL, 16); }
-        maxwell_dbg_vs = dbg_vs ? (const uint8_t *)(uintptr_t)dbg_vs : NULL;
-        // LARECOMP_DBG_FS_HASH=<fingerprint hex>:<pc hex>:<reg>: the same probe, selected by the shader's code
-        // fingerprint instead of by address. It has to be applied here rather than once inside the translator:
-        // this block runs for every program and assigns pc/reg, so a one-off assignment there would be clobbered
-        // by the next program's compile (which is why the address form always worked and the hash form did not).
-        static int hparsed, dbg_hash_on;
-        static unsigned long long dbg_hash;
-        static unsigned dbg_hpc;
-        static int dbg_hreg;
-        if (!hparsed) {
-            hparsed = 1;
-            const char *e = getenv("LARECOMP_DBG_FS_HASH");
-            if (e && sscanf(e, "%llx:%x:%d", &dbg_hash, &dbg_hpc, &dbg_hreg) == 3) {
-                dbg_hash_on = 1;
-                LOG("[dbg] probing shader %016llx pc %x reg %d\n", dbg_hash, dbg_hpc, dbg_hreg);
-            }
-        }
-        maxwell_dbg_hash = dbg_hash_on ? dbg_hash : 0;
-        if (dbg_hash_on) { maxwell_dbg_pc = dbg_hpc; maxwell_dbg_reg = dbg_hreg; }
-        else { maxwell_dbg_pc = dbg_pc; maxwell_dbg_reg = dbg_reg; }
-    }
-    // the compiler constants follow the code, so they bound the instruction scan
-    size_t vmax = p->stages[0].const_offset ? p->stages[0].const_offset : 0x10000;
-    size_t fmax = p->stages[1].const_offset ? p->stages[1].const_offset : 0x10000;
-    pr->vpart = metal_shader_part(&shader_cache, p->stages[0].code_addr, p->stages[0].code_hash, vmax, STAGE_VERTEX, vkey);
-    pr->vi = pr->vpart->info;
-    if (!pr->vi->msl) {
-        LOG("[shader] VS translate failed: %s (code %llx)\n", pr->vi->error, p->stages[0].code_addr);
-        char path[128];
-        snprintf(path, sizeof path, "build/shaders/fail_%llx_s0_code.bin", p->stages[0].code_addr);
-        FILE *f = fopen(path, "wb");
-        if (f) { fwrite((void *)(uintptr_t)p->stages[0].code_addr, 1, 0x4000, f); fclose(f); }
-        pr->failed = true;
-        return nil;
-    }
-    fkey->vs_out_mask = pr->vi->out_mask;
-    pr->fpart = metal_shader_part(&shader_cache, p->stages[1].code_addr, p->stages[1].code_hash, fmax, STAGE_FRAGMENT, fkey);
-    pr->fi = pr->fpart->info;
-    if (!pr->fi->msl) { LOG("[shader] FS translate failed: %s\n", pr->fi->error); pr->failed = true; return nil; }
-    if (getenv("LARECOMP_SAVE_MSL")) {
-        mkdir("build/msl", 0755);
-        char path[256];
-        snprintf(path, sizeof path, "build/msl/%llx_vs.metal", p->stages[0].code_addr);
-        FILE *f = fopen(path, "w"); fputs(pr->vi->msl, f); fclose(f);
-        snprintf(path, sizeof path, "build/msl/%llx_fs.metal", p->stages[1].code_addr);
-        f = fopen(path, "w"); fputs(pr->fi->msl, f); fclose(f);
-        // also keyed by the content fingerprint the [fshash] log prints: the code addresses above are heap addresses
-        // and differ between runs, so shaders can only be paired across runs/platforms by this hash
-        uint64_t vh = p->stages[0].code_addr ? hmix(1469598103934665603ull, (const void *)(uintptr_t)(p->stages[0].code_addr + 0x30), 0x200) : 0;
-        uint64_t fh = p->stages[1].code_addr ? hmix(1469598103934665603ull, (const void *)(uintptr_t)(p->stages[1].code_addr + 0x30), 0x200) : 0;
-        snprintf(path, sizeof path, "build/msl/%016llx_vs.metal", (unsigned long long)vh);
-        f = fopen(path, "w"); fputs(pr->vi->msl, f); fclose(f);
-        snprintf(path, sizeof path, "build/msl/%016llx_fs.metal", (unsigned long long)fh);
-        f = fopen(path, "w"); fputs(pr->fi->msl, f); fclose(f);
-    }
-    shader_cache_note(pr->vi->msl, pr->fi->msl);
-    if (sync_shaders()) {
-        compile_program(pr);
-        return pr->failed ? nil : pr;
-    }
-    // First-time compiles take ~40 ms each on Metal: build off the render thread; draws using this program are
-    // skipped until it's ready (the object appears a few frames later instead of the game stalling).
-    static dispatch_queue_t q;
-    if (!q) q = dispatch_queue_create("larecomp.shaders",
-#if TARGET_OS_IPHONE
-                                     DISPATCH_QUEUE_SERIAL);
-#else
-                                     DISPATCH_QUEUE_CONCURRENT);
-#endif
-    atomic_fetch_add(&pending_shader_jobs, 1);
-    dispatch_async(q, ^{ compile_program(pr); atomic_fetch_sub(&pending_shader_jobs, 1); });
-    return pr;
+    prog_tab[slot].prog = (__bridge void *)pr;
+    return pr->failed ? nil : pr;
 }
 
 static id<MTLSamplerState> sampler_for(NvnSamplerDesc *d) {
@@ -1617,60 +1650,83 @@ static void bind_cbufs(int stage, ShaderInfo *si) {
 // Compute driver constants (c0): 0x200 work group counts, 0x210 + 16*i uniform buffers (compute has
 // few hardware cbuf slots, so the compiler reads the rest through global memory), 0x310 + 16*i
 // storage buffers; each table entry is {addr_lo, addr_hi, size, 0}.
-typedef struct { id<MTLComputePipelineState> pipe; ShaderInfo *si; uint32_t local[3]; bool failed; } CsProg;
-static NSMutableDictionary *g_cs_progs;  // code address -> CsProg
+@interface CsProg : NSObject {
+@public
+    id<MTLComputePipelineState> pipe;
+    MetalShaderPart *part;
+    ShaderInfo *si;
+    uint32_t local[3];
+    _Atomic bool ready, failed;
+    __weak NSOperation *operation;
+}
+@end
+@implementation CsProg
+@end
+static NSMutableDictionary<NSData *, CsProg *> *g_cs_progs;
 
-static CsProg *compute_program(NvnProgram *p) {
-    NvnShaderStage *ss = &p->stages[5];
-    if (!ss->code_addr) return NULL;
-    uint64_t identity[2] = {ss->code_addr, ss->code_hash};
-    NSData *key = [NSData dataWithBytes:identity length:sizeof identity];
-    NSMutableDictionary *progs = g_cs_progs;
-    if (!progs) progs = g_cs_progs = [NSMutableDictionary new];
-    NSValue *v = progs[key];
-    if (v) { CsProg *cp = v.pointerValue; return cp->failed ? NULL : cp; }
-    CsProg *cp = calloc(1, sizeof *cp);
-    progs[key] = [NSValue valueWithPointer:cp];
-    maxwell_gmem_base = HEAP_BASE;
-    maxwell_gmem_size = HEAP_MAX;
-    ShaderKey k = {0};
-    cp->si = maxwell_translate((const uint8_t *)(uintptr_t)ss->code_addr, ss->const_offset ? ss->const_offset : 0x10000, STAGE_COMPUTE, &k);
-    if (!cp->si->msl) { LOG("[compute] translate failed: %s (code %llx)\n", cp->si->error, ss->code_addr); cp->failed = true; return NULL; }
-    for (int i = 0; i < 3; i++) {
-        cp->local[i] = ss->control ? *(const uint32_t *)(ss->control + 0x748 + 4 * i) : 1;
-        if (!cp->local[i]) cp->local[i] = 1;
+static void compile_compute(CsProg *cp, NSData *code, uint64_t address, uint64_t hash, size_t length) {
+    ShaderKey key = {0};
+    cp->part = metal_shader_part_source(&shader_cache, address, hash, length, STAGE_COMPUTE, &key, code.bytes);
+    cp->si = cp->part->info;
+    if (!cp->si->msl) {
+        LOG("[compute] translate failed: %s (code %llx)\n", cp->si->error, address);
+        cp->failed = true; return;
     }
+    // Preserve the existing compute math mode: these dispatches write lighting data used by later draws.
+    MTLCompileOptions *options = nil;
+    if (getenv("LARECOMP_IEEE_COMPUTE")) { options = [MTLCompileOptions new]; options.fastMathEnabled = NO; }
     NSError *err = nil;
-    // LARECOMP_IEEE_COMPUTE: compile the compute shaders with fast math off. The game builds its screen-space light
-    // table (the banked table the fragment shaders read at a dynamic offset) with compute dispatches that write
-    // gmem, and fast math governs contraction and denormals there - a different lever from which instruction the
-    // transcendentals use, which is what LARECOMP_PRECISE_MATH covers.
-    static MTLCompileOptions *copts;
-    static int copt_done;
-    if (!copt_done) {
-        copt_done = 1;
-        if (getenv("LARECOMP_IEEE_COMPUTE")) {
-            copts = [MTLCompileOptions new];
-            copts.fastMathEnabled = NO;
-        }
-    }
-    id<MTLLibrary> lib = TIMED_COMPILE([dev newLibraryWithSource:@(cp->si->msl) options:copts error:&err]);
-    id<MTLFunction> f = lib ? [lib newFunctionWithName:@"main0"] : nil;
-    cp->pipe = f ? TIMED_COMPILE([dev newComputePipelineStateWithFunction:f error:&err]) : nil;
+    id<MTLLibrary> lib = TIMED_COMPILE([dev newLibraryWithSource:@(cp->si->msl) options:options error:&err]);
+    id<MTLFunction> function = [lib newFunctionWithName:@"main0"];
+    cp->pipe = function ? TIMED_COMPILE([dev newComputePipelineStateWithFunction:function error:&err]) : nil;
     if (!cp->pipe) {
         LOG("[compute] compile failed: %s\n%s\n", err.localizedDescription.UTF8String, cp->si->msl);
-        cp->failed = true;
-        return NULL;
+        cp->failed = true; return;
     }
-    LOG("[compute] program %llx: local size %ux%ux%u, %d cbufs mask %#x\n", ss->code_addr, cp->local[0], cp->local[1],
-        cp->local[2], 0, cp->si->cbuf_mask);
-    return cp;
+    LOG("[compute] program %llx: local size %ux%ux%u, cbuf mask %#x\n", address,
+        cp->local[0], cp->local[1], cp->local[2], cp->si->cbuf_mask);
+}
+
+static CsProg *compute_program(NvnProgram *p, bool required) {
+    NvnShaderStage *stage = &p->stages[5];
+    if (!(p->stage_mask & (1u << 5)) || !stage->code_addr) return nil;
+    uint64_t identity[2] = {stage->code_addr, stage->code_hash};
+    NSData *key = [NSData dataWithBytes:identity length:sizeof identity];
+    if (!g_cs_progs) g_cs_progs = [NSMutableDictionary new];
+    CsProg *cp = g_cs_progs[key];
+    if (!cp) {
+        if (!required && atomic_load(&shader_jobs->pending) >= shader_jobs->capacity) return nil;
+        cp = [CsProg new];
+        size_t length = shader_code_length(stage, true);
+        NSData *code = [NSData dataWithBytes:(void *)(uintptr_t)stage->code_addr length:length];
+        uint64_t address = stage->code_addr, hash = stage->code_hash;
+        for (int i = 0; i < 3; i++) {
+            cp->local[i] = stage->control ? *(const uint32_t *)(stage->control + 0x748 + 4 * i) : 1;
+            if (!cp->local[i]) cp->local[i] = 1;
+        }
+        if (sync_shaders()) { compile_compute(cp, code, address, hash, length); cp->ready = true; }
+        else {
+            NSOperation *job = [shader_jobs enqueue:^{
+                compile_compute(cp, code, address, hash, length); cp->ready = true;
+            } required:required];
+            if (!job) return nil;
+            cp->operation = job;
+        }
+        g_cs_progs[key] = cp;
+    }
+    // Prefetch on bind; never skip a required compute dispatch while its shader is being prepared.
+    if (required && !cp->ready) {
+        NSOperation *job = cp->operation;
+        job.queuePriority = NSOperationQueuePriorityVeryHigh;
+        [job waitUntilFinished];
+    }
+    return cp->ready && !cp->failed ? cp : nil;
 }
 
 static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     snap_reason = "compute"; snapshots_invalidate(NULL);
     if (!st.program || !gx || !gy || !gz) return;
-    CsProg *cp = compute_program(st.program);
+    CsProg *cp = compute_program(st.program, true);
     if (!cp) return;
     static int trace = -1;
     if (trace < 0) trace = getenv("LARECOMP_TRACE_CS") != NULL;
@@ -2107,7 +2163,7 @@ static void draw(CmdRec *r, bool indexed) {
         [pk appendFormat:@" l%lu/%lu/%lu", (unsigned long)vd.layouts[s].stride, (unsigned long)vd.layouts[s].stepFunction, (unsigned long)vd.layouts[s].stepRate];
     [pk appendFormat:@" s%lu a%d", (unsigned long)pd.rasterSampleCount, pd.alphaToCoverageEnabled];
     id pobj = cache[pk];
-    NSMutableDictionary *ready_pipes = g_ready_pipes;  // async pipeline builds finished on Metal's threads
+    NSMutableDictionary *ready_pipes = g_ready_pipes;  // completed background pipeline builds
     static id pending;
     if (!ready_pipes) { ready_pipes = g_ready_pipes = [NSMutableDictionary new]; pending = [NSObject new]; }
     if (pobj == pending) {
@@ -2128,17 +2184,17 @@ static void draw(CmdRec *r, bool indexed) {
             }
             cache[pk] = pobj;
         } else {
-            cache[pk] = pending;
             NSString *k = [pk copy];
-            double t0 = now_ms();
-            atomic_fetch_add(&pending_shader_jobs, 1);
-            [dev newRenderPipelineStateWithDescriptor:pd completionHandler:^(id<MTLRenderPipelineState> ps, NSError *e) {
-                if (!ps) { static int n; if (n++ < 10) LOG("[metal] pipeline failed: %s\n", e.localizedDescription.UTF8String); }
+            NSOperation *job = [shader_jobs enqueue:^{
+                NSError *error = nil;
+                id<MTLRenderPipelineState> ps = TIMED_COMPILE([dev newRenderPipelineStateWithDescriptor:pd error:&error]);
+                if (!ps) {
+                    static _Atomic unsigned errors;
+                    if (atomic_fetch_add(&errors, 1) < 10) LOG("[metal] pipeline failed: %s\n", error.localizedDescription.UTF8String);
+                }
                 @synchronized(ready_pipes) { ready_pipes[k] = ps ? (id)ps : (id)[NSNull null]; }
-                @synchronized(cache) { stat_compile_ms += now_ms() - t0; }
-                __atomic_fetch_add(&stat_compiles, 1, __ATOMIC_RELAXED);
-                atomic_fetch_sub(&pending_shader_jobs, 1);
-            }];
+            } required:NO];
+            if (job) cache[pk] = pending;  // a full queue retries this pipeline on a later draw
             stat_skipped++;
             return;
         }
@@ -2792,7 +2848,10 @@ static void exec_list(uint64_t handle, int depth) {
             for (uint64_t i = 0; i < r->x[0] && depth < 8; i++) exec_list(h[i], depth + 1);
             break;
         }
-        case CMD_BIND_PROGRAM: st.program = (NvnProgram *)(uintptr_t)r->x[0]; break;
+        case CMD_BIND_PROGRAM:
+            st.program = (NvnProgram *)(uintptr_t)r->x[0];
+            if (st.program) (void)compute_program(st.program, false);
+            break;
         case CMD_BIND_BLEND: { uint8_t *b = x; memcpy(st.blend[b[0] & 7], b, 8); break; }
         case CMD_BIND_CHANNEL_MASK: memcpy(&st.channel_mask, x, 4); break;
         case CMD_BIND_COLOR: memcpy(st.color_state, x, 4); break;
@@ -3031,6 +3090,7 @@ static void exec_list(uint64_t handle, int depth) {
 // everything keyed by guest addresses or guest-owned objects - programs (by code address), pipelines (by program),
 // views, snapshots, bound state - so the next boot can't hit a stale entry. Metal's own shader cache stays warm.
 void renderer_reset(void) {
+    [shader_jobs reset];
     renderer_flush();
     texture_bindings_reset(&texture_bindings);
     buffer_bindings_reset(&buffer_bindings);
