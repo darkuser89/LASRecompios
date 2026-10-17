@@ -7,7 +7,7 @@
 <dict>
     <key>CFBundleDevelopmentRegion</key><string>en</string>
     <key>CFBundleExecutable</key><string>$(EXECUTABLE_NAME)</string>
-    <key>CFBundleIdentifier</key><string>com.konradkern.lasrecomp</string>
+    <key>CFBundleIdentifier</key><string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
     <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
     <key>CFBundleName</key><string>LAS Recomp</string>
     <key>CFBundleDisplayName</key><string>LAS Recomp</string>
@@ -16,6 +16,11 @@
     <key>CFBundleVersion</key><string>0.9.3</string>
     <key>CFBundleIconName</key><string>AppIcon</string>
     <key>LSRequiresIPhoneOS</key><true/>
+    <!-- Explicit game classification and Game Mode opt-in for iPhone/iPad. The OS owns activation and
+         preserves the player's per-app Game Mode preference. -->
+    <key>LSApplicationCategoryType</key><string>public.app-category.games</string>
+    <key>GCSupportsGameMode</key><true/>
+    <key>LSSupportsGameMode</key><true/>
     <key>MinimumOSVersion</key><string>17.0</string>
     <key>UIRequiredDeviceCapabilities</key><array><string>arm64</string></array>
     <key>UILaunchScreen</key><dict/>

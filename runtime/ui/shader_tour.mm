@@ -28,6 +28,7 @@ extern "C" void shader_tour_tick(uint64_t frame) {
     static int per = -1, i, end, waiting;
     static uint64_t started, applied, deadline;
     const int n = (int)(sizeof kWarpSpots / sizeof kWarpSpots[0]);
+    static bool selected[sizeof kWarpSpots / sizeof kWarpSpots[0]], selection;
     if (per < 0) {
         const char *e = ENV("LARECOMP_SHADER_TOUR"); per = e ? atoi(e) : 0;
         if (e && per < 120) per = 240;
@@ -35,8 +36,24 @@ extern "C" void shader_tour_tick(uint64_t frame) {
         end = ENV("LARECOMP_TOUR_END") ? atoi(ENV("LARECOMP_TOUR_END")) : n;
         if (i < 0) i = 0;
         if (end < 0 || end > n) end = n;
+        // Reproducible subsets (e.g. one entry in each dungeon) without visiting unrelated rooms.
+        const char *spots = ENV("LARECOMP_TOUR_SPOTS");
+        if (spots) {
+            selection = true;
+            while (*spots) {
+                char *next;
+                long index = strtol(spots, &next, 10);
+                if (next == spots || index < 0 || index >= n || (*next && *next != ',')) {
+                    LOG("[tour] invalid LARECOMP_TOUR_SPOTS: %s\n", spots);
+                    exit(2);
+                }
+                selected[index] = true;
+                spots = *next ? next + 1 : next;
+            }
+        }
     }
     if (!per) return;
+    while (selection && i < end && !selected[i]) i++;
     if (i >= end && ENV("LARECOMP_TOUR_LOOP")) { i = 0; LOG("[tour] loop\n"); }
     if (i >= end) {
         LOG("[tour] done: through %d / %d at frame %llu\n", i, n, (unsigned long long)frame);
@@ -90,7 +107,10 @@ extern "C" void shader_tour_tick(uint64_t frame) {
     bool there = ps && !strcmp((const char *)(uintptr_t)ps, w.level);
     // Wait for compilation to finish, then render a complete stable interval before taking evidence.
     if (!there || renderer_pending_shaders()) { applied = 0; return; }
-    if (!applied) applied = frame;
+    if (!applied) {
+        applied = frame;
+        LOG("[tour] settled: %d %s frame %llu\n", i, w.level, (unsigned long long)frame);
+    }
     if (frame - applied >= (uint64_t)per) {
         const char *shots = ENV("LARECOMP_TOUR_SHOTS");
         if (shots) {
