@@ -41,9 +41,14 @@ int main(void) { @autoreleasepool {
         samplers[count-1]=repeat;
         id<MTLBuffer> table = sampler_table_buffer(&tables,device,samplers,count); assert(table);
         assert(table == sampler_table_buffer(&tables,device,samplers,count));
+        assert(tables.hot_hits>0); // identical tables avoid constructing an NSData key
         assert(table.length == [function newArgumentEncoderWithBufferIndex:16].encodedLength);
         samplers[0]=repeat;
         assert(table != sampler_table_buffer(&tables,device,samplers,count));
+        samplers[0]=clamp;
+        uint64_t keys=tables.key_builds;
+        assert(table==sampler_table_buffer(&tables,device,samplers,count));
+        assert(tables.key_builds==keys); // alternating cached tables also hit the small hot cache
         id<MTLBuffer> output = [device newBufferWithLength:32 options:MTLResourceStorageModeShared];
         id<MTLCommandBuffer> cb = [queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];

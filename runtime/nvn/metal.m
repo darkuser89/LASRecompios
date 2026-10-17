@@ -243,7 +243,10 @@ uint64_t renderer_present_count(void) { return total_frames; }
 // (sx, sy) times their guest size. Shaders and the renderer keep working in guest ("logical") units.
 static float g_rs_x = 1, g_rs_y = 1;
 void renderer_get_scale(float *sx, float *sy) { *sx = g_rs_x; *sy = g_rs_y; }
-void renderer_set_scale(float sx, float sy) { g_rs_x = sx; g_rs_y = sy; }
+void renderer_set_scale(float sx, float sy) {
+    if (g_rs_x != sx || g_rs_y != sy) renderer_texture_cache_changed();
+    g_rs_x = sx; g_rs_y = sy;
+}
 
 static bool tex_scalable(const NvnTexture *t) {
     if (getenv("LARECOMP_NO_SCALE")) return false;
@@ -406,9 +409,8 @@ static void create_backend_texture(NvnTexture *t, TexBackend *b) {
     // Shaders sample depth through ordinary texture2d bindings (Maxwell has no separate depth type);
     // keep depth uncompressed so those reads see the stored values.
     if (renderer_format_is_depth(t->format)) d.allowGPUOptimizedContents = NO;
-    if (mf.force_alpha_one)
-        d.swizzle = MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleGreen,
-                                                  MTLTextureSwizzleBlue, MTLTextureSwizzleOne);
+    // Writable textures require an identity swizzle. RGB/RGBX alpha is forced by the sampled
+    // view in apply_swizzle(), while uploads and render-target writes keep a writable base.
     id<MTLTexture> tex = [dev newTextureWithDescriptor:d];
     if (!tex) {
         LOG("[metal] texture creation failed: fmt %#x %ux%ux%u target %u\n", t->format, t->width, t->height, t->depth,
@@ -517,13 +519,6 @@ static void upload_texture(NvnTexture *t, TexBackend *b, id<MTLBlitCommandEncode
     const FormatInfo *fi = t->layout.fmt;
     MtlFormat mf = mtl_format(t->format);
     uint64_t total = tegra_total_size(&t->layout);
-    // CPU-written textures (e.g. font glyph caches) change sparsely, so a strided sample can miss
-    // updates. Check at most once per frame; textures seen changing get a full hash every frame,
-    // the rest a full hash on a rotating ~16 MB/frame budget plus a cheap sample otherwise.
-    if (b->uploaded && b->checked_frame == g_frame_counter) return;
-    // Textures that have never changed since upload (almost all: loaded from files) are re-checked every 8th
-    // frame, staggered per texture; ones seen changing (glyph caches, video...) every frame.
-    if (b->uploaded && !b->dynamic && ((g_frame_counter + ((uintptr_t)b >> 6)) & 7)) return;
     b->checked_frame = g_frame_counter;
     // linear textures are the CPU-written kind (the font glyph cache, 1024x2048 R8, video): checked in full every
     // frame from the start - a strided sample missed newly rasterized glyphs, so characters of new text popped in
@@ -537,13 +532,15 @@ static void upload_texture(NvnTexture *t, TexBackend *b, id<MTLBlitCommandEncode
     if (!full && g_frame_counter - b->full_frame >= 120 && full_hash_budget >= total) { full = true; full_hash_budget -= total; }
     if (!b->tp) b->tp = texpatch_identify(t) + 1;  // (button prompts / Hero Mode icon: re-uploaded when their look changes)
     bool restyle = b->tp > 0 && b->uploaded && b->tp_gen != texpatch_generation();
-    if (!full && !restyle) {
-        uint64_t sh = fnv_sample(mem, total);
+    uint64_t sh = 0;
+    bool sampled = !full && !restyle;
+    if (sampled) {
+        sh = fnv_sample(mem, total);
         if (sh == b->sample_hash) return;
     }
     uint64_t h = hash_full(mem, total);
     b->full_frame = g_frame_counter;
-    b->sample_hash = fnv_sample(mem, total);
+    b->sample_hash = sampled ? sh : fnv_sample(mem, total);
     if (b->uploaded && h == b->data_hash && !restyle) return;
     if (b->uploaded && h != b->data_hash) b->dynamic = true;
     if (b->tp > 0) b->tp_gen = texpatch_generation();
@@ -560,7 +557,15 @@ static void upload_texture(NvnTexture *t, TexBackend *b, id<MTLBlitCommandEncode
             LevelLayout l = tegra_level(&t->layout, lv);
             uint32_t row = l.wb * fi->bpb;
             uint64_t sz = (uint64_t)row * l.hb * l.d;
-            uint8_t *lin = malloc(sz);
+            bool expand = mf.expand_rgb && fi->bpb == 3;
+            uint32_t out_row = mf.decode_bc ? l.w * mf.decode_bc : expand ? l.wb * 4 : row;
+            uint32_t out_rows = mf.decode_bc ? l.h : l.hb;
+            uint64_t out_sz = (uint64_t)out_row * out_rows * l.d;
+            id<MTLBuffer> staging = [dev newBufferWithLength:out_sz options:MTLResourceStorageModeShared];
+            if (!staging) FATAL("out of memory staging texture\n");
+            // Deswizzle/decode into the final Metal buffer. Only compressed/RGB input needs scratch storage.
+            uint8_t *lin = mf.decode_bc || expand ? malloc(sz) : staging.contents;
+            if (!lin) FATAL("out of memory preparing texture\n");
             const uint8_t *src = (const uint8_t *)(uintptr_t)t->addr + layer * layer_size + l.offset;
             if (linear) {
                 for (uint32_t y = 0; y < l.hb; y++) memcpy(lin + (uint64_t)y * row, src + y * t->stride, row);
@@ -568,9 +573,6 @@ static void upload_texture(NvnTexture *t, TexBackend *b, id<MTLBlitCommandEncode
                 tegra_deswizzle(src, lin, l.wb, l.hb, l.d, fi->bpb, l.block_height_log2, l.block_depth_log2);
             }
             if (b->tp > 0 && layer == 0) texpatch_apply(b->tp - 1, lv, lin, l.w, l.h, row);
-            uint8_t *data = lin;
-            uint32_t out_row = row;
-            uint32_t out_rows = l.hb;
             static int bc5log;  // LARECOMP_LOG_BC5: endpoint bytes of BC5 (0x4B/0x4C) textures (unorm ~128 vs snorm ~0)
             if ((t->format == 0x4B || t->format == 0x4C) && lv == 0 && bc5log < 12 && getenv("LARECOMP_LOG_BC5")) {
                 bc5log++;
@@ -580,27 +582,18 @@ static void upload_texture(NvnTexture *t, TexBackend *b, id<MTLBlitCommandEncode
                     hist[0], hist[1], hist[2], hist[3]);
             }
             if (mf.decode_bc) {
-                data = decode_bc_level(lin, t->format, l, mf.decode_bc, mf.pf == MTLPixelFormatRG8Unorm);
-                if (!data) FATAL("out of memory decoding BC texture\n");
+                decode_bc_level_into(lin, staging.contents, t->format, l, mf.decode_bc, mf.pf == MTLPixelFormatRG8Unorm);
                 free(lin);
-                lin = data;
-                out_row = l.w * mf.decode_bc;
-                out_rows = l.h;
             }
-            if (mf.expand_rgb && fi->bpb == 3) {  // RGB8 -> RGBA8
+            if (expand) {  // RGB8 -> RGBA8, directly into the final staging buffer
                 uint64_t n = (uint64_t)l.wb * l.hb * l.d;
-                data = malloc(n * 4);
+                uint8_t *data = staging.contents;
                 for (uint64_t i = 0; i < n; i++) {
                     data[i * 4] = lin[i * 3]; data[i * 4 + 1] = lin[i * 3 + 1]; data[i * 4 + 2] = lin[i * 3 + 2];
                     data[i * 4 + 3] = 255;
                 }
-                out_row = l.wb * 4;
                 free(lin);
-                lin = data;
             }
-            uint64_t out_sz = (uint64_t)out_row * out_rows * l.d;
-            id<MTLBuffer> staging = [dev newBufferWithBytes:data length:out_sz options:MTLResourceStorageModeShared];
-            free(lin);
             // the copy stays inside the texture's level: one allocated at the internal resolution (16:9, render
             // target sized - the save slots' screenshots on the title screen) can still be filled from the CPU, and its
             // full-size data overran the scaled texture (a GPU fault on Windows: runtime/nvn/vulkan/textures.c)
@@ -760,7 +753,9 @@ static id<MTLTexture> raw_view(id<MTLTexture> t) {
     MTLPixelFormat raw = pf == MTLPixelFormatRGBA8Unorm_sRGB ? MTLPixelFormatRGBA8Unorm
                        : pf == MTLPixelFormatBGRA8Unorm_sRGB ? MTLPixelFormatBGRA8Unorm : pf;
     if (raw == pf) return t;
-    id<MTLTexture> v = [t newTextureViewWithPixelFormat:raw];
+    NSUInteger slices = t.textureType == MTLTextureType3D ? 1 : t.arrayLength *
+        ((t.textureType == MTLTextureTypeCube || t.textureType == MTLTextureTypeCubeArray) ? 6 : 1);
+    id<MTLTexture> v = renderer_cached_view(t, raw, t.textureType, NSMakeRange(0, t.mipmapLevelCount), NSMakeRange(0, slices));
     return v ? v : t;
 }
 
@@ -1105,7 +1100,7 @@ void backend_present(NvnTexture *t) {
         rp.colorAttachments[0].loadAction = MTLLoadActionClear;
         rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
         rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-        id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+        id<MTLRenderCommandEncoder> enc = nil;
         // Next frame's render resolution follows the window: the 1920x1080 image scaled to fit.
         double dw = drawable.texture.width, dh = drawable.texture.height;
         extern void widescreen_frame_end(uint64_t frame);
@@ -1140,29 +1135,18 @@ void backend_present(NvnTexture *t) {
             id<MTLTexture> src = raw_view(b->tex);
             // SMAA (Video tab "Anti-aliasing"): first, at the game image's size (MetalFX then upscales its result)
             if (g_settings.antialias == AA_SMAA) {
-                [enc endEncoding];
                 src = smaa_encode(cb, src);
-                MTLRenderPassDescriptor *rp2 = [MTLRenderPassDescriptor renderPassDescriptor];
-                rp2.colorAttachments[0].texture = drawable.texture;
-                rp2.colorAttachments[0].loadAction = MTLLoadActionLoad;
-                rp2.colorAttachments[0].storeAction = MTLStoreActionStore;
-                enc = [cb renderCommandEncoderWithDescriptor:rp2];
             }
             // MetalFX (Video tab "Upscaler"): when the game image is smaller than its place in the window, Apple's
             // spatial upscaler brings it to the window's size first (the whole image, so the interior crop below
-            // still applies); the present pass then samples it about 1:1. Its own pass: the drawable's pass is
-            // ended and resumed (load) around it.
+            // still applies); the final present pass then samples it about 1:1.
             id<MTLTexture> up = metalfx_upscale(cb, src, vw / crop[2], vh / crop[3]);
             if (up) {
-                [enc endEncoding];
                 up = metalfx_encode(cb, src);
-                MTLRenderPassDescriptor *rp2 = [MTLRenderPassDescriptor renderPassDescriptor];
-                rp2.colorAttachments[0].texture = drawable.texture;
-                rp2.colorAttachments[0].loadAction = MTLLoadActionLoad;
-                rp2.colorAttachments[0].storeAction = MTLStoreActionStore;
-                enc = [cb renderCommandEncoderWithDescriptor:rp2];
                 src = up;
             }
+            // Post-processing never touches the drawable. Clear it once, in the actual output pass.
+            enc = [cb renderCommandEncoderWithDescriptor:rp];
             float flip = renderer_origin_lower_left() ? 1.0f : 0.0f;
             [enc setViewport:(MTLViewport){vx, vy, vw, vh, 0, 1}];
             [enc setRenderPipelineState:present_pipe];
@@ -1173,6 +1157,7 @@ void backend_present(NvnTexture *t) {
             [enc setFragmentSamplerState:present_sampler atIndex:0];
             [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
         }
+        if (!enc) enc = [cb renderCommandEncoderWithDescriptor:rp];
         [enc endEncoding];
         static long menu_at = -1;  // test hook: open the menu at this frame (LARECOMP_MENU_AT)
         if (menu_at < 0) menu_at = getenv("LARECOMP_MENU_AT") ? atol(getenv("LARECOMP_MENU_AT")) : 0;

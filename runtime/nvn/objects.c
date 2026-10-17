@@ -546,6 +546,7 @@ static void register_texture(Cpu *c) {
     e->tex = HOST(NvnTexture, A(2));
     e->has_view = A(3) != 0;
     if (e->has_view) memcpy(&e->view, AP(3), sizeof e->view);
+    __atomic_add_fetch(&d->generation, 1, __ATOMIC_RELEASE);
 }
 NVN(nvnTexturePoolRegisterTexture) { register_texture(c); }
 NVN(nvnTexturePoolRegisterImage) { register_texture(c); }
@@ -562,12 +563,18 @@ NVN(nvnSamplerPoolGetSize) { RET(G(uint32_t, A(0), 24)); }
 NVN(nvnSamplerPoolRegisterSampler) {
     NvnDescPool *d = HOST(NvnDescPool, A(0));
     int id = (int)A(1);
-    if (id >= 0 && id < d->count) ((NvnSamplerDesc *)d->entries)[id] = *HOST(NvnSamplerDesc, A(2));
+    if (id >= 0 && id < d->count) {
+        ((NvnSamplerDesc *)d->entries)[id] = *HOST(NvnSamplerDesc, A(2));
+        __atomic_add_fetch(&d->generation, 1, __ATOMIC_RELEASE);
+    }
 }
 NVN(nvnSamplerPoolRegisterSamplerBuilder) {
     NvnDescPool *d = HOST(NvnDescPool, A(0));
     int id = (int)A(1);
-    if (id >= 0 && id < d->count) ((NvnSamplerDesc *)d->entries)[id] = *(NvnSamplerDesc *)(AP(2) + 8);
+    if (id >= 0 && id < d->count) {
+        ((NvnSamplerDesc *)d->entries)[id] = *(NvnSamplerDesc *)(AP(2) + 8);
+        __atomic_add_fetch(&d->generation, 1, __ATOMIC_RELEASE);
+    }
 }
 
 NvnDescPool *nvn_find_pool(NvnDescPool **reg, uint64_t guest_pool) {
@@ -607,6 +614,15 @@ static void set_shaders(Cpu *c, int stride) {
         p->stages[stage].control = control;
         p->stages[stage].const_offset = *(const uint32_t *)(control + 0x700);
         p->stages[stage].const_size = *(const uint32_t *)(control + 0x6FC);
+        // Compute once when the shader is registered, not at each A/B/A shader switch in draw().
+        uint64_t h = 0xcbf29ce484222325ull, fp = 1469598103934665603ull;
+        const uint8_t *bytes = (const uint8_t *)(uintptr_t)code;
+        uint32_t length = p->stages[stage].const_offset ? p->stages[stage].const_offset : 0x10000;
+        if (length > 0x10000) length = 0x10000;
+        for (uint32_t j = 0; j < length; j++) { h ^= bytes[j]; h *= 0x100000001B3ull; }
+        if (stage != 5) for (unsigned j = 0; j < 0x200; j++) { fp ^= bytes[0x30 + j]; fp *= 0x100000001B3ull; }
+        p->stages[stage].code_hash = h;
+        p->stages[stage].fingerprint = stage == 5 ? 0 : fp;
         p->stage_mask |= 1u << stage;
     }
     RET(1);

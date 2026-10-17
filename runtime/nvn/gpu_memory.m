@@ -23,6 +23,7 @@ static NSMutableArray<id<MTLBuffer>> *buffers;
 static PoolRange mapped[GPU_MEMORY_RANGES];
 static unsigned mapped_count;
 static uint64_t mapped_generation;
+static unsigned last_range = GPU_MEMORY_RANGES;
 static id<MTLResource> __unsafe_unretained mapped_resources[GPU_MEMORY_RANGES];
 static NSCache<NSString *, id<MTLBuffer>> *views;
 static __weak id<MTLRenderCommandEncoder> resident_render;
@@ -152,6 +153,7 @@ void gpu_memory_reset(void) {
     resident_render = nil; resident_compute = nil; render_table = nil; compute_table = nil;
     resident_stages = resident_writers = 0; compute_writes = false;
     argument_buffer = nil; buffers = nil; mapped_count = 0; mapped_generation = 0;
+    last_range = GPU_MEMORY_RANGES;
     [views removeAllObjects];
     pthread_mutex_lock(&pool_lock);
     free(pools); pools = NULL; free(pool_slots); pool_slots = NULL;
@@ -219,6 +221,7 @@ static void update_pools(void) {
     *(uint32_t *)[argument_encoder constantDataAtIndex:GPU_MEMORY_RANGES * 2] = count;
     // Tables are immutable once submitted. Old command buffers retain both the old table and its resources.
     argument_buffer = table; buffers = next; mapped_count = count; mapped_generation = version;
+    last_range = GPU_MEMORY_RANGES;
     memcpy(mapped, ranges_next, count * sizeof *mapped);
     for (unsigned i = 0; i < count; i++) mapped_resources[i] = buffers[i];
     stat_builds++;
@@ -229,8 +232,20 @@ static void update_pools(void) {
 id<MTLBuffer> gpu_guest_buffer(uint64_t address, uint64_t size, uint64_t *offset) {
     if (!size || address + size < address) memory_fail("invalid buffer range");
     update_pools();
-    for (unsigned i = 0; i < mapped_count; i++) if (address >= mapped[i].base && address + size <= mapped[i].end) {
-        *offset = address - mapped[i].base; return buffers[i];
+    if (last_range < mapped_count && address >= mapped[last_range].base && address + size <= mapped[last_range].end) {
+        *offset = address - mapped[last_range].base; return buffers[last_range];
+    }
+    unsigned lo_range = 0, hi_range = mapped_count;
+    while (lo_range < hi_range) {
+        unsigned i = (lo_range + hi_range) / 2;
+        if (address < mapped[i].base) hi_range = i;
+        else if (address >= mapped[i].end) lo_range = i + 1;
+        else {
+            if (address + size <= mapped[i].end) {
+                last_range = i; *offset = address - mapped[i].base; return buffers[i];
+            }
+            break;  // spans segments: keep the existing bounded-view fallback
+        }
     }
     uint64_t lo = address & ~0x3fffull, hi = (address + size + 0x3fff) & ~0x3fffull;
     NSString *key = [NSString stringWithFormat:@"%llx/%llx", lo, hi];

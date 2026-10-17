@@ -8,9 +8,8 @@
 #include "bcdec.h"
 
 // Decode into the destination's exact texel dimensions, including small/odd edge mips and volume slices.
-static uint8_t *decode_bc_level(const uint8_t *src, uint32_t format, LevelLayout l, uint32_t bytes, bool bc5_unorm) {
-    uint8_t *out = malloc((uint64_t)l.w * l.h * l.d * bytes);
-    if (!out) return NULL;
+static void decode_bc_level_into(const uint8_t *src, uint8_t *out, uint32_t format, LevelLayout l,
+                                 uint32_t bytes, bool bc5_unorm) {
     uint32_t block_bytes = nvn_format_info(format)->bpb;
     for (uint32_t z = 0; z < l.d; z++) for (uint32_t y = 0; y < l.hb; y++) for (uint32_t x = 0; x < l.wb; x++) {
         const uint8_t *block = src + (((uint64_t)z * l.hb + y) * l.wb + x) * block_bytes;
@@ -37,5 +36,10 @@ static uint8_t *decode_bc_level(const uint8_t *src, uint32_t format, LevelLayout
             memcpy(out + (((uint64_t)z * l.h + y * 4 + row) * l.w + x * 4) * bytes,
                 (uint8_t *)rgba + row * 4 * bytes, width * bytes);
     }
+}
+
+static uint8_t *decode_bc_level(const uint8_t *src, uint32_t format, LevelLayout l, uint32_t bytes, bool bc5_unorm) {
+    uint8_t *out = malloc((uint64_t)l.w * l.h * l.d * bytes);
+    if (out) decode_bc_level_into(src, out, format, l, bytes, bc5_unorm);
     return out;
 }

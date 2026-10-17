@@ -18,6 +18,9 @@
 #include "renderer.h"
 #include "texture_bindings.h"
 #include "sampler_table.h"
+#include "render_state.h"
+#include "shader_buffers.h"
+#include "shader_cache.h"
 #ifdef LARECOMP_COMPACT_GUEST
 #include "gpu_memory.h"
 #endif
@@ -27,7 +30,6 @@ static uint64_t hmix(uint64_t h, const void *p, size_t n);  // (shader code fing
 static id<MTLDevice> dev;
 static id<MTLCommandBuffer> cmdbuf;
 static id<MTLRenderCommandEncoder> enc;
-static id<MTLRenderPipelineState> clear_pipes[64];
 static NSMutableDictionary<NSString *, id> *cache;
 // (stats) GPU wait time by cause: 0 = guest fence (nvnSyncWait), 1 = full flush (CPU reads GPU results / ring), 2 = sync all
 static uint64_t stat_wait_by[3], stat_wait_n[3];
@@ -35,6 +37,10 @@ static uint64_t stat_draws, stat_skipped, stat_passes, stat_dispatches, stat_wai
 static double stat_gpu_s;
 static TextureBindings texture_bindings;
 static SamplerTables sampler_tables;
+static RenderState render_state;
+static ShaderBuffers shader_buffers;
+static MetalShaderCache shader_cache;
+static uint64_t prepare_hits, prepare_misses;
 static uint64_t stat_texture_bind_ns;
 uint64_t g_gpu_total_ns;  // GPU time of all completed command buffers (dynamic resolution: output_scale.c)
 // (forward: texture-lifetime cleanup and stats, defined further down)
@@ -105,6 +111,16 @@ const char *renderer_stats(void) {
     if (getenv("LARECOMP_RENDER_STATS"))
         LOG("[bindings] texture/sampler requests %llu, Metal calls %llu, CPU %.3f ms\n",
             (unsigned long long)texture_bindings.requests, (unsigned long long)texture_bindings.calls, stat_texture_bind_ns / 1e6);
+    if (getenv("LARECOMP_RENDER_STATS"))
+        LOG("[render-state] requests %llu, Metal calls %llu\n", (unsigned long long)render_state.requests, (unsigned long long)render_state.calls);
+    if (getenv("LARECOMP_RENDER_STATS"))
+        LOG("[reuse] prepare %llu hits/%llu misses, constant copies %llu/%llu, shader translations %llu/%llu hits, compiles %llu/%llu hits\n",
+            (unsigned long long)prepare_hits, (unsigned long long)prepare_misses,
+            (unsigned long long)shader_buffers.copies, (unsigned long long)shader_buffers.requests,
+            (unsigned long long)shader_cache.translations, (unsigned long long)shader_cache.translation_hits,
+            (unsigned long long)__atomic_load_n(&shader_cache.compilations, __ATOMIC_RELAXED),
+            (unsigned long long)__atomic_load_n(&shader_cache.compilation_hits, __ATOMIC_RELAXED));
+    render_state.requests = render_state.calls = 0;
     texture_bindings.requests = texture_bindings.calls = 0;
     stat_texture_bind_ns = 0;
     static int dumps;
@@ -153,6 +169,7 @@ static void st_defaults(void) {
 void renderer_init(id<MTLDevice> d) {
     dev = d;
     cache = [NSMutableDictionary new];
+    render_state.legacy = getenv("LARECOMP_RENDER_STATE_LEGACY") != NULL;
     st_defaults();
 }
 
@@ -224,7 +241,10 @@ static void wait_cb(id<MTLCommandBuffer> c) {
 static pthread_mutex_t gone_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct { void *nvn, *mtl; } gone[4096];
 static int ngone;
+static _Atomic uint64_t texture_revision = 1;
+void renderer_texture_cache_changed(void) { atomic_fetch_add_explicit(&texture_revision, 1, memory_order_release); }
 void renderer_texture_gone(void *nvn_tex, void *mtl_tex) {
+    renderer_texture_cache_changed();
     pthread_mutex_lock(&gone_lock);
     if (ngone < 4096) { gone[ngone].nvn = nvn_tex; gone[ngone].mtl = mtl_tex; ngone++; }
     pthread_mutex_unlock(&gone_lock);
@@ -239,6 +259,8 @@ static void drain_gone(void) {
     for (int i = 0; i < n; i++) {
         if (local[i].mtl) views_forget(local[i].mtl);
         if (local[i].nvn) {
+            id<MTLTexture> snapshot = g_snap_copies[[NSValue valueWithPointer:local[i].nvn]];
+            if (snapshot) views_forget((__bridge void *)snapshot);
             if (g_snap_copies) [g_snap_copies removeObjectForKey:[NSValue valueWithPointer:local[i].nvn]];
             for (int k = 0; k < 8; k++) if (snap_tex[k] == local[i].nvn) { snap_tex[k] = NULL; snap_ok[k] = false; }
         }
@@ -335,7 +357,7 @@ void renderer_wait_seq(uint64_t seq) {
 // Texture view cache: views are made per bind otherwise (an allocation per draw). Keyed by the base texture and
 // the view parameters; a cached view retains its base, so a key's base pointer can't be reused while cached.
 #define VIEW_TAB 16384
-static struct { uint64_t key; void *base; void *view; } view_tab[VIEW_TAB];
+static struct { uint64_t key, params, extra; void *base; void *view; } view_tab[VIEW_TAB];
 
 // Views keep their base texture alive: when the game frees a texture its views must go too (they piled up -
 // render targets of a 32:9 window held long after the game dropped them - and a new texture at the same address
@@ -343,16 +365,21 @@ static struct { uint64_t key; void *base; void *view; } view_tab[VIEW_TAB];
 static void views_forget(void *base) {
     for (int i = 0; i < VIEW_TAB; i++)
         if (view_tab[i].base == base && view_tab[i].view) {
-            CFRelease(view_tab[i].view);
+            void *view = view_tab[i].view;
             view_tab[i].view = NULL;
             view_tab[i].base = NULL;
             view_tab[i].key = ~0ull;
             g_views_live--;
+            // Swizzle/type conversions can form a chain of views. Drop descendants before the
+            // parent so cached children cannot keep an evicted base texture alive indefinitely.
+            views_forget(view);
+            CFRelease(view);
         }
 }
 
-static id<MTLTexture> view_cached(id<MTLTexture> base, uint64_t params, id<MTLTexture> (^make)(void)) {
-    uint64_t k = ((uint64_t)(uintptr_t)(__bridge void *)base * 0x9E3779B97F4A7C15ull) ^ (params * 0xC2B2AE3D27D4EB4Full);
+static id<MTLTexture> view_cached_exact(id<MTLTexture> base, uint64_t params, uint64_t extra, id<MTLTexture> (^make)(void)) {
+    uint64_t k = ((uint64_t)(uintptr_t)(__bridge void *)base * 0x9E3779B97F4A7C15ull) ^
+        (params * 0xC2B2AE3D27D4EB4Full) ^ (extra * 0x165667B19E3779F9ull);
     if (!k) k = 1;
     if (k == ~0ull) k = 2;
     // up to 8 probes; a miss is stored in the first free or tombstoned slot of those, else over the first one.
@@ -362,7 +389,8 @@ static id<MTLTexture> view_cached(id<MTLTexture> base, uint64_t params, id<MTLTe
     uint32_t start = (uint32_t)(k ^ (k >> 32)) & (VIEW_TAB - 1), slot = start;
     int free_slot = -1;
     for (int probe = 0; probe < 8; probe++, slot = (slot + 1) & (VIEW_TAB - 1)) {
-        if (view_tab[slot].key == k && view_tab[slot].base == (__bridge void *)base) return (__bridge id<MTLTexture>)view_tab[slot].view;
+        if (view_tab[slot].key == k && view_tab[slot].params == params && view_tab[slot].extra == extra &&
+            view_tab[slot].base == (__bridge void *)base) return (__bridge id<MTLTexture>)view_tab[slot].view;
         if (!view_tab[slot].key || view_tab[slot].key == ~0ull) {
             if (free_slot < 0) free_slot = (int)slot;
             if (!view_tab[slot].key) break;  // (end of the chain)
@@ -379,12 +407,37 @@ static id<MTLTexture> view_cached(id<MTLTexture> base, uint64_t params, id<MTLTe
                 (__bridge void *)base, base.label.UTF8String, (unsigned long)base.width, (unsigned long)base.height,
                 (unsigned long)base.pixelFormat, (unsigned long)base.textureType, (unsigned long long)params, g_views_live);
     }
-    if (view_tab[slot].view) { CFRelease(view_tab[slot].view); g_views_live--; }  // evict (8 probes all taken)
+    if (view_tab[slot].view) {  // evict (8 probes all taken), including conversions based on this view
+        void *old = view_tab[slot].view;
+        view_tab[slot].view = NULL;
+        views_forget(old);
+        CFRelease(old); g_views_live--;
+    }
     g_views_live++;
     view_tab[slot].key = k;
+    view_tab[slot].params = params; view_tab[slot].extra = extra;
     view_tab[slot].base = (__bridge void *)base;
     view_tab[slot].view = (void *)CFBridgingRetain(v);
     return v;
+}
+
+static id<MTLTexture> view_cached(id<MTLTexture> base, uint64_t params, id<MTLTexture> (^make)(void)) {
+    return view_cached_exact(base, params, 0, make);
+}
+
+id<MTLTexture> renderer_cached_view(id<MTLTexture> texture, MTLPixelFormat format, MTLTextureType type,
+                                   NSRange levels, NSRange slices) {
+    uint64_t params = 0x7000000000000000ull | (uint64_t)format | (uint64_t)type << 16 |
+        (uint64_t)levels.location << 24 | (uint64_t)levels.length << 32;
+    uint64_t slice_key = (uint64_t)slices.location | (uint64_t)slices.length << 32;
+    return view_cached_exact(texture, params, slice_key, ^{
+        NSUInteger all_slices = texture.textureType == MTLTextureType3D ? 1 : texture.arrayLength *
+            ((texture.textureType == MTLTextureTypeCube || texture.textureType == MTLTextureTypeCubeArray) ? 6 : 1);
+        if (type == texture.textureType && levels.location == 0 && levels.length == texture.mipmapLevelCount &&
+            slices.location == 0 && slices.length == all_slices)
+            return [texture newTextureViewWithPixelFormat:format];
+        return [texture newTextureViewWithPixelFormat:format textureType:type levels:levels slices:slices];
+    });
 }
 
 static id<MTLTexture> view_texture(NvnTexture *t, const NvnTextureView *v, bool has_view, bool render,
@@ -420,7 +473,6 @@ static id<MTLTexture> view_texture(NvnTexture *t, const NvnTextureView *v, bool 
 }
 
 // ------------------------------------------------------------------ render passes
-static __unsafe_unretained id last_bias_enc;  // encoder the depth bias was last set on
 
 static void begin_pass(void) {
     if (enc && !st.rt_dirty) return;
@@ -476,6 +528,7 @@ static void begin_pass(void) {
     if (chunk < 0) { const char *e = ENV("LARECOMP_CHUNK_PASSES"); chunk = e ? atoi(e) : 8; }
     if (chunk > 0 && cmdbuf && ++g_passes_in_cb >= chunk) renderer_submit();
     enc = [cb() renderCommandEncoderWithDescriptor:rp];
+    render_state_begin(&render_state, enc);
     vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0;
     stat_passes++;
 }
@@ -511,7 +564,7 @@ static void apply_scissor(void) {
     if (y + sh > h) sh = h - y;
     if (sw < 0) sw = 0;
     if (sh < 0) sh = 0;
-    [enc setScissorRect:(MTLScissorRect){(NSUInteger)x, (NSUInteger)y, (NSUInteger)sw, (NSUInteger)sh}];
+    render_state_scissor(&render_state, enc, (MTLScissorRect){(NSUInteger)x, (NSUInteger)y, (NSUInteger)sw, (NSUInteger)sh});
 }
 
 // ------------------------------------------------------------------ clears (full-screen triangle)
@@ -551,53 +604,92 @@ static void attachment_formats(MTLRenderPipelineDescriptor *pd) {
         if (st.rt.color[i] && st.rt.color[i]->samples > 1) pd.rasterSampleCount = st.rt.color[i]->samples;
 }
 
+typedef struct {
+    uint32_t color[8], depth, stencil, samples, mask;
+    int32_t index, kind;
+} ClearPipelineKey;
+static struct { ClearPipelineKey key; id<MTLRenderPipelineState> pipe; } clear_pipelines[64];
+static struct { uint64_t key; id<MTLDepthStencilState> state; } clear_depth_states[64];
+static unsigned next_clear_pipeline, next_clear_depth;
+
+static ClearPipelineKey clear_pipeline_key(int index, int kind, uint32_t mask) {
+    ClearPipelineKey k = {.samples = 1, .mask = mask, .index = index, .kind = kind};
+    for (int i = 0; i < st.rt.ncolor && i < 8; i++) if (st.rt.color[i]) {
+        NvnTexture *t = st.rt.color[i];
+        k.color[i] = (uint32_t)view_texture(t, &st.rt.cview[i], st.rt.has_cview[i], true, nil).pixelFormat;
+        if (t->samples > 1) k.samples = t->samples;
+    }
+    if (st.rt.depth) {
+        uint32_t f = st.rt.depth->format, pf = (uint32_t)renderer_pixel_format(f);
+        if (renderer_format_is_depth(f) && f != 0x31) k.depth = pf;
+        if (renderer_format_has_stencil(f)) k.stencil = pf;
+    }
+    return k;
+}
+
 static void clear(int index, int kind, const void *color, uint32_t mask, bool depth, float dval, bool stencil,
                   uint32_t sval, uint32_t smask) {
     begin_pass();
+    // clear() changes pipeline/raster/buffer state directly, outside the regular draw cache.
+    render_state_reset(&render_state);
     if (g_debug_frame) {
         int pw, ph;
         pass_size(&pw, &ph);
         LOG("[clear] pass %d idx %d depth %d (%g) stencil %d | pass %dx%d scissor %d,%d %dx%d\n", debug_pass_no, index, depth,
             dval, stencil, pw, ph, st.scissor[0][0], st.scissor[0][1], st.scissor[0][2], st.scissor[0][3]);
     }
-    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
-    id<MTLLibrary> lib = clear_lib(index < 0 ? 0 : index);
-    pd.vertexFunction = [lib newFunctionWithName:@"vs"];
-    static NSString *const fs[] = {@"fs_f", @"fs_i", @"fs_u"};
-    pd.fragmentFunction = [lib newFunctionWithName:index >= 0 ? fs[kind] : @"fs_none"];
-    attachment_formats(pd);
-    for (int i = 0; i < 8; i++) pd.colorAttachments[i].writeMask = MTLColorWriteMaskNone;
-    if (index >= 0) {
-        MTLColorWriteMask m = 0;
-        if (mask & 1) m |= MTLColorWriteMaskRed;
-        if (mask & 2) m |= MTLColorWriteMaskGreen;
-        if (mask & 4) m |= MTLColorWriteMaskBlue;
-        if (mask & 8) m |= MTLColorWriteMaskAlpha;
-        pd.colorAttachments[index].writeMask = m;
-    }
-    NSError *err;
-    NSString *key = [NSString stringWithFormat:@"clear %d %d %u %d %d %lu %lu %lu", index, kind, mask, depth, stencil,
-                     (unsigned long)pd.colorAttachments[index < 0 ? 0 : index].pixelFormat,
-                     (unsigned long)pd.depthAttachmentPixelFormat, (unsigned long)pd.stencilAttachmentPixelFormat];
-    id<MTLRenderPipelineState> pipe = cache[key];
+    ClearPipelineKey ck = clear_pipeline_key(index, kind, mask);
+    id<MTLRenderPipelineState> pipe = nil;
+    for (unsigned i = 0; i < 64; i++)
+        if (clear_pipelines[i].pipe && !memcmp(&clear_pipelines[i].key, &ck, sizeof ck)) { pipe = clear_pipelines[i].pipe; break; }
     if (!pipe) {
+        MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+        id<MTLLibrary> lib = clear_lib(index < 0 ? 0 : index);
+        pd.vertexFunction = [lib newFunctionWithName:@"vs"];
+        static NSString *const fs[] = {@"fs_f", @"fs_i", @"fs_u"};
+        pd.fragmentFunction = [lib newFunctionWithName:index >= 0 ? fs[kind] : @"fs_none"];
+        for (int i = 0; i < 8; i++) {
+            pd.colorAttachments[i].pixelFormat = ck.color[i];
+            pd.colorAttachments[i].writeMask = MTLColorWriteMaskNone;
+        }
+        pd.depthAttachmentPixelFormat = ck.depth;
+        pd.stencilAttachmentPixelFormat = ck.stencil;
+        pd.rasterSampleCount = ck.samples;
+        if (index >= 0) {
+            MTLColorWriteMask m = 0;
+            if (mask & 1) m |= MTLColorWriteMaskRed;
+            if (mask & 2) m |= MTLColorWriteMaskGreen;
+            if (mask & 4) m |= MTLColorWriteMaskBlue;
+            if (mask & 8) m |= MTLColorWriteMaskAlpha;
+            pd.colorAttachments[index].writeMask = m;
+        }
+        NSError *err = nil;
         pipe = TIMED_COMPILE([dev newRenderPipelineStateWithDescriptor:pd error:&err]);
         if (!pipe) { LOG("[metal] clear pipeline: %s\n", err.localizedDescription.UTF8String); return; }
-        cache[key] = pipe;
+        unsigned slot = next_clear_pipeline++ & 63;
+        clear_pipelines[slot].key = ck; clear_pipelines[slot].pipe = pipe;
     }
-    MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new];
-    dd.depthCompareFunction = MTLCompareFunctionAlways;
-    dd.depthWriteEnabled = depth;
-    if (stencil) {
-        MTLStencilDescriptor *sd = [MTLStencilDescriptor new];
-        sd.stencilCompareFunction = MTLCompareFunctionAlways;
-        sd.depthStencilPassOperation = MTLStencilOperationReplace;
-        sd.writeMask = smask;
-        dd.frontFaceStencil = sd;
-        dd.backFaceStencil = sd;
+    uint64_t dk = ((uint64_t)(stencil ? smask : 0) << 2) | (depth ? 1 : 0) | (stencil ? 2 : 0);
+    id<MTLDepthStencilState> ds = nil;
+    for (unsigned i = 0; i < 64; i++)
+        if (clear_depth_states[i].state && clear_depth_states[i].key == dk) { ds = clear_depth_states[i].state; break; }
+    if (!ds) {
+        MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new];
+        dd.depthCompareFunction = MTLCompareFunctionAlways;
+        dd.depthWriteEnabled = depth;
+        if (stencil) {
+            MTLStencilDescriptor *sd = [MTLStencilDescriptor new];
+            sd.stencilCompareFunction = MTLCompareFunctionAlways;
+            sd.depthStencilPassOperation = MTLStencilOperationReplace;
+            sd.writeMask = smask;
+            dd.frontFaceStencil = sd; dd.backFaceStencil = sd;
+        }
+        ds = [dev newDepthStencilStateWithDescriptor:dd];
+        unsigned slot = next_clear_depth++ & 63;
+        clear_depth_states[slot].key = dk; clear_depth_states[slot].state = ds;
     }
     [enc setRenderPipelineState:pipe];
-    [enc setDepthStencilState:[dev newDepthStencilStateWithDescriptor:dd]];
+    [enc setDepthStencilState:ds];
     [enc setStencilReferenceValue:sval];
     [enc setCullMode:MTLCullModeNone];
     int w, h;
@@ -640,6 +732,7 @@ static int cbuf_base = 3, tex_base = 8;
 @public
     id<MTLFunction> vs, fs;
     ShaderInfo *vi, *fi;
+    MetalShaderPart *vpart, *fpart;
     bool failed;
     _Atomic bool ready;  // functions compiled (async compile: draws are skipped until then)
 }
@@ -902,19 +995,12 @@ static bool sync_shaders(void) {  // LARECOMP_SYNC_SHADERS: compile on first use
 }
 
 static void compile_program(Prog *pr) {
-    NSError *err = nil;
-    static MTLCompileOptions *vopts;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ vopts = [MTLCompileOptions new]; vopts.preserveInvariance = YES; });
     double t0 = now_ms();
-    // LARECOMP_SHADER_SALT=<text>: tag sources so Metal's disk cache misses (measure cold first-use compiles)
-    NSString *salt = getenv("LARECOMP_SHADER_SALT") ? [NSString stringWithFormat:@"\n// %s\n", getenv("LARECOMP_SHADER_SALT")] : @"";
-    id<MTLLibrary> vl = [dev newLibraryWithSource:[@(pr->vi->msl) stringByAppendingString:salt] options:vopts error:&err];
-    if (!vl) { LOG("[shader] VS compile failed: %s\n%s\n", err.localizedDescription.UTF8String, pr->vi->msl); pr->failed = true; return; }
-    id<MTLLibrary> fl = [dev newLibraryWithSource:[@(pr->fi->msl) stringByAppendingString:salt] options:nil error:&err];
-    if (!fl) { LOG("[shader] FS compile failed: %s\n%s\n", err.localizedDescription.UTF8String, pr->fi->msl); pr->failed = true; return; }
-    pr->vs = [vl newFunctionWithName:@"main0"];
-    pr->fs = [fl newFunctionWithName:@"main0"];
+    NSString *error = nil;
+    pr->vs = metal_shader_function(&shader_cache, dev, pr->vi->msl, true, &error);
+    if (!pr->vs) { LOG("[shader] VS compile failed: %s\n", error.UTF8String); pr->failed = true; return; }
+    pr->fs = metal_shader_function(&shader_cache, dev, pr->fi->msl, false, &error);
+    if (!pr->fs) { LOG("[shader] FS compile failed: %s\n", error.UTF8String); pr->failed = true; return; }
     __atomic_fetch_add(&stat_compiles, 1, __ATOMIC_RELAXED);
     double dt = now_ms() - t0;
     @synchronized(cache) { stat_compile_ms += dt; }
@@ -930,11 +1016,14 @@ static Prog *get_program(NvnProgram *p, ShaderKey *vkey, ShaderKey *fkey) {
     const uint8_t *vb = (const uint8_t *)vkey;
     for (size_t i = 0; i < sizeof *vkey; i++) { h ^= vb[i]; h *= 0x100000001B3ull; }
     for (int i = 0; i < 8; i++) { h ^= fkey->rt_kind[i]; h *= 0x100000001B3ull; }
+    h = hmix(h, &p->stages[0].code_hash, sizeof p->stages[0].code_hash);
+    h = hmix(h, &p->stages[1].code_hash, sizeof p->stages[1].code_hash);
     if (!h) h = 1;
     uint32_t slot = (uint32_t)(h ^ (h >> 31)) & (PROG_TAB - 1);
     while (prog_tab[slot].key && prog_tab[slot].key != h) slot = (slot + 1) & (PROG_TAB - 1);
     if (prog_tab[slot].key) { Prog *fp = (__bridge Prog *)prog_tab[slot].prog; return fp->failed ? nil : fp; }
-    NSString *key = [NSString stringWithFormat:@"%llx/%llx/%@/%@%s", p->stages[0].code_addr, p->stages[1].code_addr,
+    NSString *key = [NSString stringWithFormat:@"%llx/%llx/%llx/%llx/%@/%@%s", p->stages[0].code_addr, p->stages[1].code_addr,
+                     p->stages[0].code_hash, p->stages[1].code_hash,
                      [NSData dataWithBytes:vkey length:sizeof *vkey], [NSData dataWithBytes:fkey->rt_kind length:8],
                      vkey->flip_x ? "/mirror" : ""];  // (NSData's description elides the middle of the key's bytes)
     Prog *pr = cache[key];
@@ -985,7 +1074,8 @@ static Prog *get_program(NvnProgram *p, ShaderKey *vkey, ShaderKey *fkey) {
     // the compiler constants follow the code, so they bound the instruction scan
     size_t vmax = p->stages[0].const_offset ? p->stages[0].const_offset : 0x10000;
     size_t fmax = p->stages[1].const_offset ? p->stages[1].const_offset : 0x10000;
-    pr->vi = maxwell_translate((const uint8_t *)(uintptr_t)p->stages[0].code_addr, vmax, STAGE_VERTEX, vkey);
+    pr->vpart = metal_shader_part(&shader_cache, p->stages[0].code_addr, p->stages[0].code_hash, vmax, STAGE_VERTEX, vkey);
+    pr->vi = pr->vpart->info;
     if (!pr->vi->msl) {
         LOG("[shader] VS translate failed: %s (code %llx)\n", pr->vi->error, p->stages[0].code_addr);
         char path[128];
@@ -996,7 +1086,8 @@ static Prog *get_program(NvnProgram *p, ShaderKey *vkey, ShaderKey *fkey) {
         return nil;
     }
     fkey->vs_out_mask = pr->vi->out_mask;
-    pr->fi = maxwell_translate((const uint8_t *)(uintptr_t)p->stages[1].code_addr, fmax, STAGE_FRAGMENT, fkey);
+    pr->fpart = metal_shader_part(&shader_cache, p->stages[1].code_addr, p->stages[1].code_hash, fmax, STAGE_FRAGMENT, fkey);
+    pr->fi = pr->fpart->info;
     if (!pr->fi->msl) { LOG("[shader] FS translate failed: %s\n", pr->fi->error); pr->failed = true; return nil; }
     if (getenv("LARECOMP_SAVE_MSL")) {
         mkdir("build/msl", 0755);
@@ -1127,10 +1218,14 @@ static id<MTLTexture> apply_swizzle(id<MTLTexture> tex, NvnTexture *t, const Nvn
     const uint8_t *sw = (has_view && (v->setmask & 8)) ? v->swizzle : t->swizzle;
     uint8_t c[4];
     for (int i = 0; i < 4; i++) c[i] = sw[i] <= 5 ? sw[i] : (uint8_t)(2 + i);
-    if (!c[0] && !c[1] && !c[2] && !c[3]) return tex;  // never set: identity
-    if (renderer_format_alpha_one(t->format))
+    bool alpha_one = renderer_format_alpha_one(t->format);
+    if (!c[0] && !c[1] && !c[2] && !c[3]) {
+        if (!alpha_one) return tex;  // never set: identity
+        for (int i = 0; i < 4; i++) c[i] = 2 + i;
+    }
+    if (alpha_one)
         for (int i = 0; i < 4; i++) if (c[i] == MTLTextureSwizzleAlpha) c[i] = MTLTextureSwizzleOne;
-    if (c[0] == 2 && c[1] == 3 && c[2] == 4 && c[3] == (renderer_format_alpha_one(t->format) ? 1 : 5)) return tex;
+    if (c[0] == 2 && c[1] == 3 && c[2] == 4 && c[3] == 5) return tex;
     if (tex.sampleCount > 1 || renderer_format_is_depth(t->format)) return tex;
     uint32_t swz = c[0] | c[1] << 8 | c[2] << 16 | (uint32_t)c[3] << 24;
     MTLTextureSwizzleChannels chans = MTLTextureSwizzleChannelsMake(c[0], c[1], c[2], c[3]);
@@ -1241,6 +1336,7 @@ static void resolve_feedback(Prog *pr) {
             id<MTLTexture> src = renderer_texture(t, nil, true);
             id<MTLTexture> dst = copies[key];
             if (!dst || dst.width != src.width || dst.height != src.height || dst.pixelFormat != src.pixelFormat) {
+                if (dst) views_forget((__bridge void *)dst);
                 MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:src.pixelFormat width:src.width
                                                                                            height:src.height mipmapped:NO];
                 d.textureType = src.textureType == MTLTextureType2DMultisample ? MTLTextureType2DMultisample : MTLTextureType2D;
@@ -1263,6 +1359,78 @@ static void resolve_feedback(Prog *pr) {
         }
 }
 
+// Per-frame preparation is separate from encoder binding. Upload checks still run on each new
+// frame; descriptor replacement, texture destruction/reallocation and scale changes force a miss.
+// Weak Metal handles cannot keep evicted textures/views alive or match freed/reused addresses.
+typedef struct {
+    NvnDescPool *tpool, *spool;
+    uint64_t tgen, sgen, handle, frame, revision;
+    int type, stage;
+    bool valid, cursor;
+    __weak id<MTLTexture> texture;
+    __weak id<MTLSamplerState> sampler;
+    NvnTexEntry *entry;
+    float scale[2];
+    uint32_t size[2];
+    int bottle, heart;
+} PreparedBinding;
+#define PREPARED_BINDINGS 1024
+static PreparedBinding prepared_bindings[PREPARED_BINDINGS];
+
+
+static PreparedBinding *prepare_binding(int stage, int index, ShaderTexture *shader) {
+    (void)index;
+    int slot = ((int)shader->handle_offset - 0x20) / 8;
+    uint64_t h = slot >= 0 && slot < 32 ? st.tex[stage][slot] : 0;
+    uint64_t tg = st.tpool ? __atomic_load_n(&st.tpool->generation, __ATOMIC_ACQUIRE) : 0;
+    uint64_t sg = st.spool ? __atomic_load_n(&st.spool->generation, __ATOMIC_ACQUIRE) : 0;
+    uint64_t revision = atomic_load_explicit(&texture_revision, memory_order_acquire);
+    uint64_t frame = renderer_present_count();
+    uint64_t hash = h * 0x9E3779B97F4A7C15ull ^ (uintptr_t)st.tpool ^ ((uintptr_t)st.spool << 7) ^
+        ((uint64_t)stage << 23) ^ ((uint64_t)shader->type << 31);
+    unsigned start = (unsigned)(hash ^ (hash >> 32)) & (PREPARED_BINDINGS - 1);
+    PreparedBinding *b = &prepared_bindings[start], *free_slot = NULL;
+    for (unsigned probe = 0; probe < 4; probe++) {
+        PreparedBinding *candidate = &prepared_bindings[(start + probe) & (PREPARED_BINDINGS - 1)];
+        if (candidate->valid && candidate->frame == frame && candidate->revision == revision) {
+            if (candidate->handle == h && candidate->type == shader->type && candidate->stage == stage &&
+                candidate->tpool == st.tpool && candidate->spool == st.spool && candidate->tgen == tg && candidate->sgen == sg &&
+                candidate->texture && candidate->sampler) { prepare_hits++; return candidate; }
+        } else if (!free_slot) free_slot = candidate;
+    }
+    if (free_slot) b = free_slot;
+    prepare_misses++;
+    b->valid = false; b->entry = NULL; b->scale[0] = b->scale[1] = 1;
+    b->size[0] = b->size[1] = 0; b->bottle = b->heart = 0; b->cursor = false;
+    uint32_t tic = h & 0xFFFFF, tsc = (uint32_t)(h >> 20) & 0xFFF;
+    id<MTLTexture> texture = nil;
+    if (h && st.tpool && tic < (uint32_t)st.tpool->count) {
+        NvnTexEntry *e = b->entry = &((NvnTexEntry *)st.tpool->entries)[tic];
+        if (e->tex) {
+            texture = sampled_texture(e->tex, &e->view, e->has_view, shader->type);
+            renderer_texture_scale(e->tex, &b->scale[0], &b->scale[1]);
+            b->size[0] = e->tex->width; b->size[1] = e->tex->height;
+            if (stage == 1) {
+                extern int renderer_texpatch_of(NvnTexture *t);
+                extern int texpatch_bottle_kind(int id), texpatch_heart_kind(int id);
+                extern bool texpatch_is_item_cursor(int id);
+                int id = renderer_texpatch_of(e->tex);
+                b->bottle = texpatch_bottle_kind(id); b->heart = texpatch_heart_kind(id);
+                b->cursor = texpatch_is_item_cursor(id);
+            }
+        }
+    }
+    id<MTLSamplerState> sampler = h && st.spool && tsc < (uint32_t)st.spool->count ?
+        sampler_for(&((NvnSamplerDesc *)st.spool->entries)[tsc]) : nil;
+    b->texture = texture ? texture : dummy_texture(shader->type);
+    b->sampler = sampler ? sampler : default_sampler();
+    b->frame = frame; b->revision = atomic_load_explicit(&texture_revision, memory_order_acquire);
+    b->handle = h; b->type = shader->type; b->stage = stage;
+    b->tpool = st.tpool; b->spool = st.spool; b->tgen = tg; b->sgen = sg;
+    b->valid = true;
+    return b;
+}
+
 static void bind_textures(int stage, ShaderInfo *si) {
     uint64_t bind_start = ENV("LARECOMP_RENDER_STATS") ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
     texture_bindings_begin(&texture_bindings, enc);
@@ -1280,36 +1448,26 @@ static void bind_textures(int stage, ShaderInfo *si) {
     if (stage == 1) draw_bottle = draw_heart = 0, draw_item_cursor = false;
     for (int i = 0; i < si->ntex; i++) {
         ShaderTexture *st_ = &si->tex[i];
-        int slot = ((int)st_->handle_offset - 0x20) / 8;  // 64-bit handles from offset 0x20
-        uint64_t h = (slot >= 0 && slot < 32) ? st.tex[stage][slot] : 0;
-        id<MTLTexture> tex = nil;
-        id<MTLSamplerState> smp = nil;
-        uint32_t tic = h & 0xFFFFF, tsc = (uint32_t)(h >> 20) & 0xFFF;
-        tex_sc[stage][i][0] = tex_sc[stage][i][1] = 1;
-        if (i < 64) tex_wh[stage][i][0] = tex_wh[stage][i][1] = 0;
-        if (h && st.tpool && tic < (uint32_t)st.tpool->count) {
-            NvnTexEntry *e = &((NvnTexEntry *)st.tpool->entries)[tic];
-            if (e->tex) tex = sampled_texture(e->tex, &e->view, e->has_view, st_->type);
-            if (e->tex && stage == 1) {
-                extern int renderer_texpatch_of(NvnTexture *t);
-                extern int texpatch_bottle_kind(int id);
-                extern int texpatch_heart_kind(int id);
-                extern bool texpatch_is_item_cursor(int id);
-                int id = renderer_texpatch_of(e->tex);
-                if (!draw_bottle) draw_bottle = texpatch_bottle_kind(id);
-                if (!draw_heart) draw_heart = texpatch_heart_kind(id);
-                draw_item_cursor |= texpatch_is_item_cursor(id);
-            }
-            if (e->tex && i < 64) {
-                renderer_texture_scale(e->tex, &tex_sc[stage][i][0], &tex_sc[stage][i][1]);
-                tex_wh[stage][i][0] = e->tex->width; tex_wh[stage][i][1] = e->tex->height;
-            }
+        PreparedBinding *prepared = prepare_binding(stage, i, st_);
+        id<MTLTexture> tex = prepared->texture;
+        id<MTLSamplerState> smp = prepared->sampler;
+        NvnTexEntry *e = prepared->entry;
+        uint64_t h = prepared->handle;
+        uint32_t tsc = (uint32_t)(h >> 20) & 0xFFF;
+        memcpy(tex_sc[stage][i], prepared->scale, sizeof prepared->scale);
+        memcpy(tex_wh[stage][i], prepared->size, sizeof prepared->size);
+        if (stage == 1) {
+            if (!draw_bottle) draw_bottle = prepared->bottle;
+            if (!draw_heart) draw_heart = prepared->heart;
+            draw_item_cursor |= prepared->cursor;
+        }
+        if (e) {
             for (int k = 0; k < nfeedback; k++)
                 if (e->tex == feedback_tex[k]) {
                     id<MTLTexture> fc = feedback_copy[k];
                     MTLTextureType want = mtl_type_for(st_->type);
                     if (fc.textureType != want && want == MTLTextureType2DArray)
-                        fc = [fc newTextureViewWithPixelFormat:fc.pixelFormat textureType:MTLTextureType2DArray levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 1)];
+                        fc = renderer_cached_view(fc, fc.pixelFormat, MTLTextureType2DArray, NSMakeRange(0, 1), NSMakeRange(0, 1));
                     tex = fc;
                 }
             if (g_debug_frame && e->tex && e->tex->addr) {
@@ -1358,9 +1516,7 @@ static void bind_textures(int stage, ShaderInfo *si) {
                     e->tex->height, e->tex->format, e->tex->addr, total, nz, renderer_is_gpu_owned(e->tex));
             }
         }
-        if (h && st.spool && tsc < (uint32_t)st.spool->count) smp = sampler_for(&((NvnSamplerDesc *)st.spool->entries)[tsc]);
-        if (!tex) tex = dummy_texture(st_->type);
-        if (!smp) smp = default_sampler();
+
         if (g_debug_frame && tex.textureType == MTLTextureType2D && stage == 1) {
             static int dn;
             char path[128];
@@ -1405,9 +1561,10 @@ static void bind_cbufs(int stage, ShaderInfo *si) {
             NvnShaderStage *ss = &st.program->stages[stage];
             uint64_t size = ss->const_size ? ss->const_size : 16;
             if (size < si->cbuf_size[1]) size = si->cbuf_size[1];
-            uint64_t off = ring_alloc((void *)(uintptr_t)(ss->code_addr + ss->const_offset), size);
-            if (stage == 0) [enc setVertexBuffer:ring offset:off atIndex:1];
-            else [enc setFragmentBuffer:ring offset:off atIndex:1];
+            id<MTLBuffer> constants = shader_constant_buffer(&shader_buffers, dev, ss->code_addr + ss->const_offset, size);
+            if (!constants) FATAL("out of memory caching shader constants\n");
+            if (stage == 0) [enc setVertexBuffer:constants offset:0 atIndex:1];
+            else [enc setFragmentBuffer:constants offset:0 atIndex:1];
             continue;
         }
         int idx = k - cbuf_base;
@@ -1440,7 +1597,8 @@ static NSMutableDictionary *g_cs_progs;  // code address -> CsProg
 static CsProg *compute_program(NvnProgram *p) {
     NvnShaderStage *ss = &p->stages[5];
     if (!ss->code_addr) return NULL;
-    NSValue *key = [NSValue valueWithPointer:(void *)(uintptr_t)ss->code_addr];
+    uint64_t identity[2] = {ss->code_addr, ss->code_hash};
+    NSData *key = [NSData dataWithBytes:identity length:sizeof identity];
     NSMutableDictionary *progs = g_cs_progs;
     if (!progs) progs = g_cs_progs = [NSMutableDictionary new];
     NSValue *v = progs[key];
@@ -1515,7 +1673,10 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
             NvnShaderStage *ss = &st.program->stages[5];
             uint64_t size = ss->const_size ? ss->const_size : 16;
             if (size < si->cbuf_size[1]) size = si->cbuf_size[1];
-            off = ring_alloc((void *)(uintptr_t)(ss->code_addr + ss->const_offset), size);
+            id<MTLBuffer> constants = shader_constant_buffer(&shader_buffers, dev, ss->code_addr + ss->const_offset, size);
+            if (!constants) FATAL("out of memory caching compute constants\n");
+            [ce setBuffer:constants offset:0 atIndex:1];
+            continue;
         } else {
             int idx = k - cbuf_base;
             Range r = (idx >= 0 && idx < 18) ? st.ubuf[5][idx] : (Range){0, 0};
@@ -1544,28 +1705,22 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     __unsafe_unretained id<MTLSamplerState> compute_samplers[32];
     for (int i = 0; i < si->ntex; i++) {
         ShaderTexture *st_ = &si->tex[i];
-        int slot = ((int)st_->handle_offset - 0x20) / 8;
-        uint64_t h = (slot >= 0 && slot < 32) ? st.tex[5][slot] : 0;
-        id<MTLTexture> tex = nil;
-        id<MTLSamplerState> smp = nil;
-        uint32_t tic = h & 0xFFFFF, tsc = (uint32_t)(h >> 20) & 0xFFF;
-        tex_sc[0][i][0] = tex_sc[0][i][1] = 1;
-        if (h && st.tpool && tic < (uint32_t)st.tpool->count) {
-            NvnTexEntry *e = &((NvnTexEntry *)st.tpool->entries)[tic];
-            if (e->tex) tex = sampled_texture(e->tex, &e->view, e->has_view, st_->type);
-            if (e->tex && i < 64) renderer_texture_scale(e->tex, &tex_sc[0][i][0], &tex_sc[0][i][1]);
+        PreparedBinding *prepared = prepare_binding(5, i, st_);
+        id<MTLTexture> tex = prepared->texture;
+        id<MTLSamplerState> smp = prepared->sampler;
+        NvnTexEntry *e = prepared->entry;
+        memcpy(tex_sc[0][i], prepared->scale, sizeof prepared->scale);
+        if (e) {
             for (int k = 0; k < nfeedback; k++)
                 if (e->tex == feedback_tex[k]) {
                     id<MTLTexture> fc = feedback_copy[k];
                     MTLTextureType want = mtl_type_for(st_->type);
                     if (fc.textureType != want && want == MTLTextureType2DArray)
-                        fc = [fc newTextureViewWithPixelFormat:fc.pixelFormat textureType:MTLTextureType2DArray levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 1)];
+                        fc = renderer_cached_view(fc, fc.pixelFormat, MTLTextureType2DArray, NSMakeRange(0, 1), NSMakeRange(0, 1));
                     tex = fc;
                 }
         }
-        if (h && st.spool && tsc < (uint32_t)st.spool->count) smp = sampler_for(&((NvnSamplerDesc *)st.spool->entries)[tsc]);
-        [ce setTexture:tex ? tex : dummy_texture(st_->type) atIndex:i];
-        smp = smp ? smp : default_sampler();
+        [ce setTexture:tex atIndex:i];
         if (si->uses_sampler_table) compute_samplers[i] = smp;
         else [ce setSamplerState:smp atIndex:i];
     }
@@ -1610,7 +1765,9 @@ static MTLPrimitiveType prim_type(uint32_t mode, bool *ok) {
 static id<MTLBuffer> expand_indices(uint32_t mode, uint32_t count, const void *indices, int itype, uint32_t first,
                                     uint32_t *out_count) {
     uint32_t tris = mode == 7 ? count / 4 * 2 : count >= 3 ? count - 2 : 0;
-    uint32_t *out = malloc(tris * 3 * 4 + 4);
+    id<MTLBuffer> b = [dev newBufferWithLength:(NSUInteger)tris * 3 * 4 + 4 options:MTLResourceStorageModeShared];
+    if (!b) FATAL("out of memory expanding indices\n");
+    uint32_t *out = b.contents;
     uint32_t n = 0;
 #define IDX(i) (indices ? (itype == 0 ? ((const uint8_t *)indices)[i] : itype == 1 ? ((const uint16_t *)indices)[i] : ((const uint32_t *)indices)[i]) : first + (i))
     if (mode == 7) {  // quads
@@ -1623,8 +1780,6 @@ static id<MTLBuffer> expand_indices(uint32_t mode, uint32_t count, const void *i
     }
 #undef IDX
     *out_count = n;
-    id<MTLBuffer> b = [dev newBufferWithBytes:out length:n * 4 + 4 options:MTLResourceStorageModeShared];
-    free(out);
     return b;
 }
 
@@ -1786,12 +1941,8 @@ static void draw(CmdRec *r, bool indexed) {
     }
     {   // Interiors/dungeons draw a 16:9 backdrop quad over the still-rendered overworld: frames that
         // draw it are presented cropped to 16:9 (see backend_present).
-        static uint64_t last_fs, last_hash;
         uint64_t fs = st.program->stages[1].code_addr;
-        if (fs != last_fs) {
-            last_fs = fs;
-            last_hash = fs ? hmix(1469598103934665603ull, (const void *)(uintptr_t)(fs + 0x30), 0x200) : 0;
-        }
+        uint64_t last_hash = st.program->stages[1].fingerprint;
         static uint64_t log_hash = 1;
         if (log_hash == 1) log_hash = getenv("LARECOMP_LOG_FSHASH") ? 0 : 2;
         if (!log_hash && g_debug_frame) LOG("[fshash] fs=%llx hash %016llx\n", fs, last_hash);
@@ -1845,8 +1996,9 @@ static void draw(CmdRec *r, bool indexed) {
     for (int i = 0; i < st.rt.ncolor; i++)
         if (st.rt.color[i] && ((st.channel_mask >> (i * 4)) & 0xF)) snapshots_invalidate(st.rt.color[i]);
     begin_pass();
+    render_state_begin(&render_state, enc);
 
-    // vertex streams this draw reads (also computed inside the pipeline build on a cache miss)
+    // Compute used streams once; both the draw and a pipeline cache miss consume this mask.
     uint32_t used_streams = 0;
     for (int i = 0; i < 32; i++) {
         if (!(pr->vi->attr_mask & (1u << i))) continue;
@@ -1877,13 +2029,11 @@ static void draw(CmdRec *r, bool indexed) {
             vd.layouts[30].stepFunction = MTLVertexStepFunctionConstant;
             vd.layouts[30].stepRate = 0;
             vd.layouts[30].stride = 16;
-            used_streams |= 1u << 31;
             continue;
         }
         vd.attributes[i].format = vertex_format(fmt);
         vd.attributes[i].offset = off;
         vd.attributes[i].bufferIndex = 18 + stream;
-        used_streams |= 1u << stream;
         (void)is_int_format;
     }
     for (int s = 0; s < 12; s++) {
@@ -1972,7 +2122,7 @@ static void draw(CmdRec *r, bool indexed) {
     pipe_tab[pslot].key = phash;
     pipe_tab[pslot].pipe = (__bridge void *)pipe;  // retained by the cache dictionary
     }
-    [enc setRenderPipelineState:pipe];
+    render_state_pipeline(&render_state, enc, pipe);
 
     // depth / stencil
     static uint64_t last_dsk;
@@ -2008,32 +2158,27 @@ static void draw(CmdRec *r, bool indexed) {
         dss = [dev newDepthStencilStateWithDescriptor:dd];
         cache[dk] = dss;
     }
-    [enc setDepthStencilState:dss];
+    render_state_depth(&render_state, enc, dss);
     last_dsk = dsk;
     last_dss = dss;
-    [enc setStencilFrontReferenceValue:st.stencil_ref[0] backReferenceValue:st.stencil_ref[1]];
-    [enc setBlendColorRed:st.blend_color[0] green:st.blend_color[1] blue:st.blend_color[2] alpha:st.blend_color[3]];
+    render_state_stencil(&render_state, enc, st.stencil_ref[0], st.stencil_ref[1]);
+    render_state_blend(&render_state, enc, st.blend_color);
 
     // rasterizer
     uint8_t cull = st.poly[0];
     if (vkey.flip_x) cull = 0;  // (mirror mode's composite: one full-screen quad, either winding)
-    [enc setCullMode:cull == 1 ? MTLCullModeFront : cull == 2 ? MTLCullModeBack : MTLCullModeNone];
+    render_state_cull(&render_state, enc, cull == 1 ? MTLCullModeFront : cull == 2 ? MTLCullModeBack : MTLCullModeNone);
     bool ccw = st.poly[1] == 1;
-    [enc setFrontFacingWinding:(ccw != vkey.flip_y) ? MTLWindingCounterClockwise : MTLWindingClockwise];
-    [enc setTriangleFillMode:st.poly[2] == 1 ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
+    render_state_winding(&render_state, enc, (ccw != vkey.flip_y) ? MTLWindingCounterClockwise : MTLWindingClockwise);
+    render_state_fill(&render_state, enc, st.poly[2] == 1 ? MTLTriangleFillModeLines : MTLTriangleFillModeFill);
     {   // polygon offset (decals on floors: without it they z-fight). Enables: bit 2 = fill (NVN PolygonOffsetEnable)
-        static float last[3] = {0, 0, 0};
         float f[3] = {0, 0, 0};
         static int off = -1;  // LARECOMP_NO_DEPTH_BIAS: ignore the game's polygon offset (A/B tests)
         if (off < 0) off = getenv("LARECOMP_NO_DEPTH_BIAS") != NULL;
         if ((st.poly[3] & 4) && !off) memcpy(f, st.poly_offset, sizeof f);
         static int nlog;
         if ((st.poly[3] & 4) && nlog < 3 && getenv("LARECOMP_LOG_BIAS")) { nlog++; LOG("[bias] factor %g units %g clamp %g\n", st.poly_offset[0], st.poly_offset[1], st.poly_offset[2]); }
-        if (memcmp(f, last, sizeof f) || enc != last_bias_enc) {
-            [enc setDepthBias:f[1] slopeScale:f[0] clamp:f[2]];
-            memcpy(last, f, sizeof f);
-            last_bias_enc = enc;
-        }
+        render_state_bias(&render_state, enc, f);
     }
     float *vp = st.viewport[0];
     float zn = st.depth_range[0][0], zf = st.depth_range[0][1];
@@ -2133,7 +2278,7 @@ static void draw(CmdRec *r, bool indexed) {
         float k = widescreen_effect_stretch(g_cur_fs_hash);
         double vx = vp[0] * vp_sx + vp_ox, vw = vp[2] * vp_sx;
         if (k > 1.0f) { vx -= vw * (k - 1) / 2; vw *= k; }
-        [enc setViewport:(MTLViewport){vx, vp[1] * vp_sy + vp_oy, vw, vp[3] * vp_sy, zn, zf}];
+        render_state_viewport(&render_state, enc, (MTLViewport){vx, vp[1] * vp_sy + vp_oy, vw, vp[3] * vp_sy, zn, zf});
     }
     apply_scissor();
     if (pr->fi->uses_rscale) {  // [0] = render target scale, [1 + i] = scale of texture i
@@ -2236,66 +2381,57 @@ static void draw(CmdRec *r, bool indexed) {
         }
     }
     if (!nruns) { run_at[0] = 0; run_n[0] = inst_all; nruns = 1; run_gold[0] = false; }
-    for (int ri = 0; ri < nruns; ri++) {
-    if (nruns > 1 || run_gold[0]) {
-        float tint[8] = {0};
-        extern void pot_gold_tint(float tint[8]);
-        if (run_gold[ri]) pot_gold_tint(tint);
-        [enc setFragmentBytes:tint length:sizeof tint atIndex:19];
-    }
-    // draw
+    // Geometry is identical for every tint run. Prepare/convert its indices exactly once.
     bool native;
     uint32_t mode = (uint32_t)r->x[0];
     MTLPrimitiveType pt = prim_type(mode, &native);
-    if (!indexed) {
-        uint32_t first = (uint32_t)r->x[1], count = (uint32_t)r->x[2], base_inst = base_all + run_at[ri], inst = run_n[ri];
-        if (native) {
-            [enc drawPrimitives:pt vertexStart:first vertexCount:count instanceCount:inst baseInstance:base_inst];
-        } else if (mode == 6 || mode == 7 || mode == 9) {
-            uint32_t n;
-            id<MTLBuffer> ib = expand_indices(mode, count, NULL, 0, first, &n);
-            [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:n indexType:MTLIndexTypeUInt32 indexBuffer:ib
-                     indexBufferOffset:0 instanceCount:inst baseVertex:0 baseInstance:base_inst];
-        } else { stat_skipped++; return; }
-    } else {
-        uint32_t itype = (uint32_t)r->x[1], count = (uint32_t)r->x[2];
+    id<MTLBuffer> draw_ib = nil;
+    uint64_t draw_ioff = 0;
+    uint32_t draw_count = (uint32_t)r->x[2];
+    MTLIndexType draw_itype = MTLIndexTypeUInt32;
+    int32_t draw_base_vertex = indexed ? (int32_t)r->x[4] : 0;
+    bool use_indices = indexed || !native;
+    if (!native) {
+        if (!indexed && mode != 6 && mode != 7 && mode != 9) { stat_skipped++; return; }
+        draw_ib = expand_indices(mode, draw_count, indexed ? (const void *)(uintptr_t)r->x[3] : NULL,
+                                 indexed ? (int)r->x[1] : 0, indexed ? 0 : (uint32_t)r->x[1], &draw_count);
+        pt = MTLPrimitiveTypeTriangle;
+    } else if (indexed) {
+        uint32_t itype = (uint32_t)r->x[1];
         uint64_t iaddr = r->x[3];
-        int32_t base_vertex = (int32_t)r->x[4];
-        uint32_t base_inst = base_all + run_at[ri], inst = run_n[ri];
-        if (native && itype != 0) {
-            MTLIndexType it = itype == 1 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
+        if (!itype) {
+            draw_ib = [dev newBufferWithLength:(NSUInteger)draw_count * 4 + 4 options:MTLResourceStorageModeShared];
+            if (!draw_ib) FATAL("out of memory widening indices\n");
+            uint32_t *w = draw_ib.contents;
+            for (uint32_t i = 0; i < draw_count; i++) w[i] = ((const uint8_t *)(uintptr_t)iaddr)[i];
+        } else {
             uint32_t isz = itype == 1 ? 2 : 4;
-            id<MTLBuffer> ib;
-            uint64_t ioff;
+            draw_itype = itype == 1 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
 #ifdef LARECOMP_COMPACT_GUEST
-            if (count && (iaddr % isz) == 0) {
-                ib = gpu_guest_buffer(iaddr, (uint64_t)count * isz, &ioff);
+            if (draw_count && (iaddr % isz) == 0) {
+                draw_ib = gpu_guest_buffer(iaddr, (uint64_t)draw_count * isz, &draw_ioff);
 #else
-            if (iaddr >= HEAP_BASE && iaddr + (uint64_t)count * isz <= HEAP_BASE + HEAP_MAX && (iaddr % isz) == 0) {
-                ib = g_guest_buffer; ioff = iaddr - HEAP_BASE;
+            if (iaddr >= HEAP_BASE && iaddr + (uint64_t)draw_count * isz <= HEAP_BASE + HEAP_MAX && (iaddr % isz) == 0) {
+                draw_ib = g_guest_buffer; draw_ioff = iaddr - HEAP_BASE;
 #endif
             } else {
-                ioff = ring_alloc((void *)(uintptr_t)iaddr, (uint64_t)count * isz); ib = ring;
+                draw_ioff = ring_alloc((void *)(uintptr_t)iaddr, (uint64_t)draw_count * isz); draw_ib = ring;
             }
-            [enc drawIndexedPrimitives:pt indexCount:count indexType:it indexBuffer:ib indexBufferOffset:ioff
-                         instanceCount:inst baseVertex:base_vertex baseInstance:base_inst];
-        } else {
-            uint32_t n;
-            id<MTLBuffer> ib;
-            if (native) {  // 8-bit indices: widen
-                uint32_t *w = malloc(count * 4 + 4);
-                for (uint32_t i = 0; i < count; i++) w[i] = ((const uint8_t *)(uintptr_t)iaddr)[i];
-                ib = [dev newBufferWithBytes:w length:count * 4 + 4 options:MTLResourceStorageModeShared];
-                free(w);
-                n = count;
-            } else {
-                ib = expand_indices(mode, count, (const void *)(uintptr_t)iaddr, (int)itype, 0, &n);
-                pt = MTLPrimitiveTypeTriangle;
-            }
-            [enc drawIndexedPrimitives:pt indexCount:n indexType:MTLIndexTypeUInt32 indexBuffer:ib indexBufferOffset:0
-                         instanceCount:inst baseVertex:base_vertex baseInstance:base_inst];
         }
     }
+    for (int ri = 0; ri < nruns; ri++) {
+        if (nruns > 1 || run_gold[0]) {
+            float tint[8] = {0};
+            extern void pot_gold_tint(float tint[8]);
+            if (run_gold[ri]) pot_gold_tint(tint);
+            [enc setFragmentBytes:tint length:sizeof tint atIndex:19];
+        }
+        uint32_t base_inst = base_all + run_at[ri], inst = run_n[ri];
+        if (use_indices)
+            [enc drawIndexedPrimitives:pt indexCount:draw_count indexType:draw_itype indexBuffer:draw_ib indexBufferOffset:draw_ioff
+                         instanceCount:inst baseVertex:draw_base_vertex baseInstance:base_inst];
+        else
+            [enc drawPrimitives:pt vertexStart:(uint32_t)r->x[1] vertexCount:draw_count instanceCount:inst baseInstance:base_inst];
     }  // runs
     stat_draws++;
     if (dbg_this) {
@@ -2396,7 +2532,9 @@ static id<MTLTexture> copy_raw_view(id<MTLTexture> t) {
     MTLPixelFormat raw = pf == MTLPixelFormatRGBA8Unorm_sRGB ? MTLPixelFormatRGBA8Unorm
                        : pf == MTLPixelFormatBGRA8Unorm_sRGB ? MTLPixelFormatBGRA8Unorm : pf;
     if (raw == pf) return t;
-    id<MTLTexture> v = [t newTextureViewWithPixelFormat:raw];
+    NSUInteger slices = t.textureType == MTLTextureType3D ? 1 : t.arrayLength *
+        ((t.textureType == MTLTextureTypeCube || t.textureType == MTLTextureTypeCubeArray) ? 6 : 1);
+    id<MTLTexture> v = renderer_cached_view(t, raw, t.textureType, NSMakeRange(0, t.mipmapLevelCount), NSMakeRange(0, slices));
     return v ? v : t;
 }
 
@@ -2567,7 +2705,7 @@ static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t fl
             || s.pixelFormat == MTLPixelFormatDepth24Unorm_Stencil8
 #endif
         )
-            sdepth = [s newTextureViewWithPixelFormat:s.pixelFormat];
+            sdepth = renderer_cached_view(s, s.pixelFormat, s.textureType, NSMakeRange(0, s.mipmapLevelCount), NSMakeRange(0, 1));
         float r[4] = {(float)sx0 / s.width, (float)sy0 / s.height, (float)sw / s.width, (float)sh / s.height};
         [e setRenderPipelineState:pipe];
         [e setDepthStencilState:always];
@@ -2856,6 +2994,9 @@ void renderer_reset(void) {
     renderer_flush();
     texture_bindings_reset(&texture_bindings);
     sampler_tables_reset(&sampler_tables);
+    shader_buffers_reset(&shader_buffers);
+    metal_shader_cache_reset(&shader_cache);
+    render_state_reset(&render_state);
     pthread_mutex_lock(&gone_lock);
     ngone = 0;
     pthread_mutex_unlock(&gone_lock);
@@ -2872,12 +3013,17 @@ void renderer_reset(void) {
     @synchronized(g_ready_pipes) { [g_ready_pipes removeAllObjects]; }
     g_boot_gen++;
     [g_snap_copies removeAllObjects];
+    for (int i = 0; i < PREPARED_BINDINGS; i++) {
+        prepared_bindings[i].valid = false;
+        prepared_bindings[i].texture = nil; prepared_bindings[i].sampler = nil;
+    }
+    renderer_texture_cache_changed();
     memset(snap_tex, 0, sizeof snap_tex);
     memset(snap_ok, 0, sizeof snap_ok);
     for (int i = 0; i < 4; i++) { feedback_tex[i] = NULL; feedback_copy[i] = nil; }
     nfeedback = 0;
     g_cur_fs_hash = 0;
-    last_bias_enc = nil;
+    render_state_reset(&render_state);
     pthread_mutex_lock(&cb_lock);
     last_cb = nil;
     for (int i = 0; i < CB_HIST; i++) cb_hist[i] = nil;  // (they retain the old guest heap buffer)

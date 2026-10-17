@@ -11,8 +11,13 @@ static void solid(uint32_t format, const uint64_t *block, uint32_t bytes, const 
         for (uint32_t i=0; i<level.wb*level.hb*level.d; i++) memcpy(packed+i*fi->bpb,block,fi->bpb);
         uint8_t *pixels = decode_bc_level(packed,format,level,bytes,false);
         assert(pixels);
+        uint64_t size=(uint64_t)w*h*level.d*bytes;
+        uint8_t *direct=malloc(size+16); memset(direct,0xa5,size+16);
+        decode_bc_level_into(packed,direct,format,level,bytes,false);
+        assert(!memcmp(pixels,direct,size));
+        for (unsigned j=0;j<16;j++) assert(direct[size+j]==0xa5);
         for (uint32_t i=0; i<w*h*level.d; i++) assert(!memcmp(pixels+i*bytes,expected,bytes));
-        free(pixels); free(packed);
+        free(direct); free(pixels); free(packed);
     }
 }
 

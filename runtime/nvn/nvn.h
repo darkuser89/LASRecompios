@@ -58,6 +58,7 @@ typedef struct NvnDescPool {
     uint64_t addr;
     int count;
     void *entries;  // NvnTexEntry[] or NvnSamplerDesc[]
+    uint64_t generation;  // published after descriptor replacement; backend preparation caches must re-resolve
 } NvnDescPool;
 
 typedef struct NvnShaderStage {
@@ -65,6 +66,7 @@ typedef struct NvnShaderStage {
     uint64_t code_addr;       // GPU (== CPU) address of the code
     const uint8_t *control;   // control section
     uint32_t const_offset, const_size;  // compiler constants (bound as c1), within the code blob
+    uint64_t code_hash, fingerprint;  // immutable code identity and the 512-byte effect fingerprint
     void *backend;
 } NvnShaderStage;
 

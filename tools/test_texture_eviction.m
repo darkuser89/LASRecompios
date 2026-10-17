@@ -24,6 +24,34 @@ static void check_pixels(NvnTexture *t, uint8_t value) {
     for(unsigned i=0;i<256*256*4;i++)assert(((uint8_t *)readback.contents)[i]==value);
 }
 
+static void check_upload(uint32_t format, const uint64_t *block, const uint8_t *expected, uint32_t bytes) {
+    NvnTexture t={.target=1,.format=format,.width=7,.height=5,.depth=1,.levels=3};
+    t.layout=(TexLayout){.width=7,.height=5,.depth=1,.layers=1,.levels=3,.fmt=nvn_format_info(format)};
+    tegra_layout_init(&t.layout);
+    uint8_t *memory=calloc(1,tegra_total_size(&t.layout)); assert(memory); t.addr=(uintptr_t)memory;
+    for (unsigned level=0;level<3;level++) {
+        LevelLayout l=tegra_level(&t.layout,level);
+        uint32_t bpb=t.layout.fmt->bpb;
+        uint8_t *linear=malloc(l.wb*l.hb*bpb);
+        for (unsigned i=0;i<l.wb*l.hb;i++) memcpy(linear+i*bpb,block,bpb);
+        tegra_swizzle(linear,memory+l.offset,l.wb,l.hb,1,bpb,l.block_height_log2,l.block_depth_log2);
+        free(linear);
+    }
+    id<MTLTexture> texture=renderer_texture(&t,nil,false); assert(texture);
+    for (unsigned level=0;level<3;level++) {
+        LevelLayout l=tegra_level(&t.layout,level);
+        NSUInteger row=256; // Metal readback alignment, independent of the tightly packed staging layout
+        id<MTLBuffer> output=[dev newBufferWithLength:row*l.h options:MTLResourceStorageModeShared];
+        id<MTLCommandBuffer> cb=[queue commandBuffer]; id<MTLBlitCommandEncoder> bl=[cb blitCommandEncoder];
+        [bl copyFromTexture:texture sourceSlice:0 sourceLevel:level sourceOrigin:MTLOriginMake(0,0,0)
+            sourceSize:MTLSizeMake(l.w,l.h,1) toBuffer:output destinationOffset:0 destinationBytesPerRow:row destinationBytesPerImage:row*l.h];
+        [bl endEncoding]; [cb commit]; [cb waitUntilCompleted]; assert(!cb.error);
+        for (unsigned y=0;y<l.h;y++) for (unsigned x=0;x<l.w;x++)
+            assert(!memcmp((uint8_t *)output.contents+y*row+x*bytes,expected,bytes));
+    }
+    backend_texture_destroyed(&t); free(memory);
+}
+
 int main(void) { @autoreleasepool {
     setenv("LARECOMP_TEXTURE_CACHE_MB","1",1);
     dev=MTLCreateSystemDefaultDevice(); assert(dev);
@@ -59,5 +87,16 @@ int main(void) { @autoreleasepool {
     trim_texture_cache();
     for(unsigned i=0;i<10;i++){backend_texture_destroyed(&textures[i]);free((void *)(uintptr_t)textures[i].addr);}
     assert(g_tex_live==0 && g_tex_live_bytes==0 && g_reg_n==0);
+    setenv("LARECOMP_SOFTWARE_BC","1",1);
+    const uint8_t red[]={255,0,0,255}, transparent[]={0,0,0,0}, signed_r[]={129}, signed_rg[]={129,63};
+    uint64_t bc1[]={0x07e0f800,0}, bc2[]={~0ull,0x07e0f800}, bc3[]={255,0x07e0f800};
+    uint64_t bc4[]={0x7f81,0}, bc5[]={0x7f81,63}, black[]={0,0};
+    check_upload(0x42,bc1,red,4); check_upload(0x46,bc1,red,4);
+    check_upload(0x43,bc2,red,4); check_upload(0x44,bc3,red,4);
+    check_upload(0x4a,bc4,signed_r,1); check_upload(0x4c,bc5,signed_rg,2); check_upload(0x4d,black,transparent,4);
+    const uint8_t half_black[]={0,0,0,0,0,0,0,0x3c}; check_upload(0x50,black,half_black,8);
+    uint64_t rgb[]={0x1e140a,0}; const uint8_t rgba[]={10,20,30,255}; check_upload(0x19,rgb,rgba,4);
+    assert(g_tex_live==0 && g_tex_live_bytes==0 && g_reg_n==0);
     printf("Texture cache: %u cold copies dropped, byte-exact GPU restore, protected resources, repeat eviction and teardown passed\n",evicted);
+    puts("Direct staging: BC1/2/3/4/5/6H/7, sRGB and RGB expansion, odd sizes and 3 mip levels read back exactly");
 } }

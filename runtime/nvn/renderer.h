@@ -5,6 +5,8 @@
 void renderer_init(id<MTLDevice> dev);
 id<MTLCommandQueue> renderer_queue(void);
 id<MTLTexture> renderer_texture(NvnTexture *t, id<MTLBlitCommandEncoder> blit, bool for_render);
+id<MTLTexture> renderer_cached_view(id<MTLTexture> texture, MTLPixelFormat format, MTLTextureType type,
+                                   NSRange levels, NSRange slices);
 MTLPixelFormat renderer_pixel_format(uint32_t nvn_format);
 bool renderer_format_alpha_one(uint32_t nvn_format);
 extern id<MTLBuffer> g_guest_buffer;
@@ -19,5 +21,6 @@ const char *renderer_stats(void);
 bool renderer_format_is_depth(uint32_t f);
 bool renderer_format_has_stencil(uint32_t f);
 void renderer_mark_gpu_owned(NvnTexture *t);
+void renderer_texture_cache_changed(void);  // storage replacement/destruction or render-scale change
 void input_handle_event(const SDL_Event *e);
 bool input_user_blocked(const SDL_Event *e);
