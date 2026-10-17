@@ -2093,6 +2093,14 @@ ShaderInfo *maxwell_translate_snapshot(const uint8_t *blob, size_t max_size, int
     bool dbg = stage == STAGE_FRAGMENT &&
                ((maxwell_dbg_code && guest_address == (uintptr_t)maxwell_dbg_code) ||
                 (maxwell_dbg_hash && maxwell_code_fp(blob) == maxwell_dbg_hash));
+    // The game's tiled-light culler steps both axes by 2 / screenHeight, assuming aspect ==
+    // screenWidth / screenHeight. Camera aspect patches break that assumption: guest render targets
+    // keep their 16:9 dimensions. Scale only its horizontal tile edges by cameraAspect / (16/9).
+    // Match the captured 1.0.0 culler and both instructions; other compute programs stay untouched.
+    bool light_tiles = stage == STAGE_COMPUTE && max_size >= 0x230 &&
+                       maxwell_code_fp(blob) == 0x2672b4de27376680ull &&
+                       ((const uint64_t *)code)[0x198 / 8] == 0x5c68100000d7030dull &&
+                       ((const uint64_t *)code)[0x1a8 / 8] == 0x5c6810000087030bull;
     static int annotate = -1;
     if (annotate < 0) annotate = getenv("LARECOMP_SAVE_MSL") != NULL;
     c->branchy = any_branch;
@@ -2102,6 +2110,10 @@ ShaderInfo *maxwell_translate_snapshot(const uint8_t *blob, size_t max_size, int
         if (any_branch && label[i]) sp(&c->body, "  case %uu:\n", pc);
         if (annotate) sp(&c->body, "    // pc %x: %016llx\n", pc, (unsigned long long)((const uint64_t *)code)[i]);
         emit_insn(c, ((const uint64_t *)code)[i], pc);
+        if (light_tiles && (pc == 0x198 || pc == 0x1a8)) {
+            int reg = pc == 0x198 ? 13 : 11;
+            sp(&c->body, "    r%d = as_type<uint>(as_type<float>(r%d) * as_type<float>(cb4[27][3]) * (9.0f / 16.0f));\n", reg, reg);
+        }
         if (dbg && pc == maxwell_dbg_pc) {
             int rr = maxwell_dbg_reg % 1000, half = maxwell_dbg_reg / 1000;  // +1000: low f16, +2000: high f16
             c->reg_used[rr] = 1;
