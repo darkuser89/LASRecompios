@@ -44,6 +44,7 @@ void controls_bindings_draw(float scale);  // controls_ui.mm
 // ------------------------------------------------------------------ state shared with the main thread
 static std::atomic<bool> g_open{false};
 static std::atomic<bool> g_text_busy{false};  // a text field / the on-screen keyboard has the keys (render thread: ui_text_busy)
+static std::atomic<bool> g_want_native_text{false};  // only an active text field needs the system keyboard
 static std::atomic<bool> g_want_fullscreen_apply{false};
 
 struct QEvent {
@@ -143,6 +144,7 @@ static ImGuiKey key_from_pad(Uint8 b) {
 // directly when the player last used a keyboard, an on-screen keyboard (d-pad + A, B deletes, Start / + OK) when
 // they last used a controller.
 static std::atomic<int> g_kbd{0};  // 1 open, 2 confirmed, 3 cancelled
+static std::atomic<bool> g_kbd_focus{false};
 static std::atomic<bool> g_last_pad{false};
 static char g_kbd_text[96];
 static int g_kbd_max = 8;
@@ -258,7 +260,9 @@ void menu_apply_window_requests(void *win) {
     SDL_Window *w = (SDL_Window *)win;
     g_pixel_density = SDL_GetWindowPixelDensity(w);
     static bool text_input;
-    bool want_text = capturing();
+    // Capturing menu input alone must not summon the iPhone/iPad keyboard. The render thread publishes the
+    // actual text-field state; our controller keyboard already draws its own keys.
+    bool want_text = capturing() && g_want_native_text.load();
     if (want_text != text_input) {
         if (want_text) SDL_StartTextInput(w);
         else SDL_StopTextInput(w);
@@ -641,16 +645,21 @@ RT_ON_RESET(menu_reset) {
 static void keyboard_draw(ImGuiIO &io, float scale) {
     ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), io.DisplaySize, IM_COL32(0, 0, 0, 120));
     float w = fminf(io.DisplaySize.x * 0.9f, 1100 * scale);
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    // Keep the name field and its touch actions above the native landscape keyboard.
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, 24 * scale), ImGuiCond_Always, ImVec2(0.5f, 0));
+#else
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+#endif
     ImGui::SetNextWindowSize(ImVec2(w, 0), ImGuiCond_Always);
     ImGui::Begin("##kbd", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
                                     ImGuiWindowFlags_AlwaysAutoResize);
     ImGui::PushFont(g_font_big);
     ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "Enter your name");
     ImGui::PopFont();
-    static bool was_open, was_pad;
-    bool pad = g_last_pad.load(), appearing = !was_open || pad != was_pad;  // (switching device: focus the new one)
-    was_open = true, was_pad = pad;
+    static bool was_pad;
+    bool pad = g_last_pad.load(), appearing = g_kbd_focus.exchange(false) || pad != was_pad;
+    was_pad = pad;
     if (!pad) {  // keyboard: type straight into the field
         if (appearing) ImGui::SetKeyboardFocusHere();
         ImGui::SetNextItemWidth(-1);
@@ -661,12 +670,16 @@ static void keyboard_draw(ImGuiIO &io, float scale) {
         ImGui::PopFont();
         if ((int)strlen(g_kbd_text) > g_kbd_max) g_kbd_text[g_kbd_max] = 0;
         ImGui::TextDisabled("Enter  confirm      Esc  cancel      (%d / %d)", (int)strlen(g_kbd_text), g_kbd_max);
+        if (ImGui::Button("Cancel", ImVec2(180 * scale, 52 * scale))) g_kbd = 3;
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!g_kbd_text[0]);
+        if (ImGui::Button("OK", ImVec2(180 * scale, 52 * scale))) g_kbd = 2;
+        ImGui::EndDisabled();
     } else {  // controller: on-screen keyboard (osk.mm, shared with our menus' text fields)
         int r = osk_keys(g_kbd_text, sizeof g_kbd_text, g_kbd_max, appearing, scale, g_font_big);
         if (r) g_kbd = r > 0 ? 2 : 3;  // (Start / + confirms in menu_handle_event too)
     }
     ImGui::End();
-    if (g_kbd.load() != 1) was_open = false;
 }
 
 // Game thread (runtime/hle/swkbd.c): show the dialog, re-present the last frame until it's answered.
@@ -676,6 +689,7 @@ extern "C" int menu_keyboard_run(const char *initial, int max_len, char *out, in
     snprintf(g_kbd_text, sizeof g_kbd_text, "%s", initial ? initial : "");
     g_kbd_max = max_len > 0 && max_len < (int)sizeof g_kbd_text / 4 ? max_len : 8;
     input_reset();
+    g_kbd_focus = true;
     g_kbd = 1;
     // (test) LARECOMP_KBD_AUTO=<text>: answer at once
     if (getenv("LARECOMP_KBD_AUTO")) { snprintf(g_kbd_text, sizeof g_kbd_text, "%s", getenv("LARECOMP_KBD_AUTO")); g_kbd = 2; }
@@ -838,6 +852,7 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     bool chaos = !open && chaos_overlay_wanted();
     bool kbd = g_kbd.load() == 1;
     if (!open && !kbd && !g_settings.show_fps && !inv && !trk && !chaos && !touch_pad_wanted(false, true)) {
+        g_want_native_text = false;
         if (g_inited) { pthread_mutex_lock(&q_lock); q_events.clear(); pthread_mutex_unlock(&q_lock); }
         return;
     }
@@ -946,6 +961,7 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     touch_pad_draw((float)tw, (float)th, open, true);  // on-screen controls: under the overlay, over the game
     ImGui::Render();
     g_text_busy = open && ui_text_busy();
+    g_want_native_text = (g_open.load() || g_kbd.load() == 1) && io.WantTextInput && !osk_is_open();
 #ifdef __APPLE__
     id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
     ImGui_ImplMetal_RenderDrawData(ImGui::GetDrawData(), cb, enc);
