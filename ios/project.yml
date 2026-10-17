@@ -1,4 +1,4 @@
-# The iPadOS app (xcodegen: `make ios-app` generates build/ios/LASRecomp.xcodeproj from this).
+# The iPhone/iPad app (xcodegen: `make ios-app` generates build/ios/LASRecomp.xcodeproj from this).
 #
 # The Makefile builds what is not Xcode's business - the static iOS SDL3 + FFmpeg (tools/build_deps_ios.sh), the
 # recompiled game code for the iOS guest base (make ios-game-lib -> build/ios/liblasgame_ios.a) and the generated
@@ -63,6 +63,7 @@ targets:
     settings:
       base:
         PRODUCT_NAME: LAS Recomp
+        TARGETED_DEVICE_FAMILY: "1,2"
         INFOPLIST_FILE: Info.plist
         CODE_SIGN_ENTITLEMENTS: LASRecomp.entitlements
         PRODUCT_BUNDLE_IDENTIFIER: com.konradkern.lasrecomp

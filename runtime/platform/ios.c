@@ -21,7 +21,6 @@
 #include <stdlib.h>
 #include <sys/mman.h>
 #include <sys/ucontext.h>
-#include <sys/sysctl.h>
 #include <sys/statvfs.h>
 #include <unistd.h>
 
@@ -31,15 +30,13 @@
 static mach_timebase_info_data_t tb;
 
 void plat_init(void) {
-    uint64_t physical = 0;
-    size_t physical_size = sizeof physical;
-    if (sysctlbyname("hw.memsize", &physical, &physical_size, NULL, 0) == 0 && physical <= (4ull << 30)) {
-        // Defaults only: settings_load() subsequently restores any explicit choice by the player.
-        // Half the width and height cuts the scalable render-target allocations to one quarter.
-        g_settings.res_mode = RES_Q50;
-        g_settings.upscaler = UPSCALE_METALFX;
-        fprintf(stderr, "[ios] low-memory defaults: half-resolution render targets, MetalFX spatial upscale\n");
-    }
+    // Defaults only: settings_load() subsequently restores any explicit choice by the player.
+    // More RAM does not remove the GPU cost of a phone's high-resolution display. Half the width
+    // and height keeps scalable render targets at one quarter of the full-display pixel count,
+    // on both iPhone and iPad; MetalFX brings the result back to the display's resolution.
+    g_settings.res_mode = RES_Q50;
+    g_settings.upscaler = UPSCALE_METALFX;
+    fprintf(stderr, "[ios] mobile defaults: half-resolution render targets, MetalFX spatial upscale\n");
     // iOS has no console: everything the runtime logs goes to stderr, which is the unified log when the app is
     // started from Xcode or `devicectl process launch --console`; runtime/paths.c also tees it into the data root.
     fprintf(stderr, "[ios] available memory before boot: %llu MB\n",
